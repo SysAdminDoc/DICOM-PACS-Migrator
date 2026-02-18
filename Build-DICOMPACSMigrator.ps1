@@ -31,6 +31,7 @@ $Dependencies = @(
     "PyQt5==5.15.10",
     "pydicom==2.4.4",
     "pynetdicom==2.0.2",
+    "Pillow",
     "PyInstaller==5.13.2"
 )
 
@@ -416,7 +417,6 @@ $piArgs = @(
     "--exclude-module", "matplotlib",
     "--exclude-module", "numpy",
     "--exclude-module", "scipy",
-    "--exclude-module", "PIL",
     "--exclude-module", "cv2",
     "--exclude-module", "unittest",
     "--exclude-module", "test",

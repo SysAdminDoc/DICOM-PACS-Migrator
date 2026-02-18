@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v0.3.0
+DICOM PACS Migrator v0.4.0
 Bulk DICOM C-STORE migration tool with network auto-discovery,
-resume support, post-migration verification, filtering, and audit trail.
+resume support, post-migration verification, filtering, streaming
+migration, decompress fallback, and audit trail.
 Copy-only architecture — source data is NEVER modified or deleted.
 """
 
@@ -14,7 +15,7 @@ def _bootstrap():
         return
     if sys.version_info < (3, 8):
         print("Python 3.8+ required"); sys.exit(1)
-    required = ['PyQt5', 'pydicom', 'pynetdicom']
+    required = ['PyQt5', 'pydicom', 'pynetdicom', 'Pillow']
     for pkg in required:
         mod = pkg.lower().replace('-', '_')
         try:
@@ -59,7 +60,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 APP_NAME = "DICOM PACS Migrator"
 
 DATA_SAFETY_NOTICE = (
@@ -79,6 +80,41 @@ TRANSFER_SYNTAXES = [
     JPEGBaseline8Bit, JPEGExtended12Bit, JPEGLosslessSV1,
     JPEGLossless, JPEG2000Lossless, JPEG2000, RLELossless,
 ]
+
+
+def try_send_c_store(assoc, ds, fpath, decompress_fallback=True, log_fn=None):
+    """Attempt C-STORE. On presentation context rejection, decompress in-memory and retry.
+    Returns (status_value, message, decompressed_flag).
+    status_value: 0x0000=success, 0xFF00/0xFF01=pending, negative=exception, None=no response."""
+    try:
+        st = assoc.send_c_store(ds)
+        if st:
+            return (st.Status, "", False)
+        return (None, "No response from SCP", False)
+    except Exception as e:
+        err_msg = str(e)
+        if 'presentation context' not in err_msg.lower() or not decompress_fallback:
+            return (-1, err_msg, False)
+
+        # Presentation context rejected — try decompressing to uncompressed transfer syntax
+        try:
+            original_tsuid = getattr(ds.file_meta, 'TransferSyntaxUID', None) if hasattr(ds, 'file_meta') else None
+            ts_name = str(original_tsuid.name) if original_tsuid and hasattr(original_tsuid, 'name') else str(original_tsuid or 'Unknown')
+
+            ds.decompress()
+
+            try:
+                st = assoc.send_c_store(ds)
+                if st:
+                    if log_fn:
+                        log_fn(f"  Decompressed {ts_name} -> Explicit VR LE: {os.path.basename(fpath)}")
+                    return (st.Status, f"Decompressed from {ts_name}", True)
+                return (None, "No response after decompress", True)
+            except Exception as e2:
+                return (-1, f"Failed after decompress: {e2}", True)
+        except Exception as decomp_err:
+            # Decompression not possible (missing codec, etc.)
+            return (-1, f"No context + decompress failed: {decomp_err}", False)
 
 DARK_STYLE = """
 QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Consolas', monospace; }
@@ -147,8 +183,9 @@ class MigrationManifest:
     """Persistent JSON manifest tracking every file's migration status.
     Enables resume after crash and CSV export for audit."""
 
-    def __init__(self, manifest_path=None):
+    def __init__(self, manifest_path=None, save_to_disk=True):
         self.path = manifest_path
+        self.save_to_disk = save_to_disk
         self.records = {}  # sop_instance_uid -> record dict
         self.meta = {
             'created': datetime.now().isoformat(),
@@ -176,7 +213,7 @@ class MigrationManifest:
         return False
 
     def save(self):
-        if not self.path:
+        if not self.path or not self.save_to_disk:
             return
         try:
             with open(self.path, 'w') as f:
@@ -373,6 +410,7 @@ class NetworkDiscoveryThread(QThread):
 # ═══════════════════════════════════════════════════════════════════════════════
 class ScannerThread(QThread):
     progress = pyqtSignal(int, int)
+    current_file = pyqtSignal(str, int, int)  # filename, dicom_count, skipped_count
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     log = pyqtSignal(str)
@@ -388,15 +426,37 @@ class ScannerThread(QThread):
         try:
             results = []
             self.log.emit(f"Scanning (READ-ONLY): {self.folder_path}")
+            self.status.emit("Enumerating files...")
             root = Path(self.folder_path)
-            all_files = [f for f in root.glob('**/*' if self.recursive else '*') if f.is_file()]
+
+            # Use os.walk instead of glob — yields incrementally on large stores
+            all_files = []
+            dir_count = 0
+            for dirpath, dirnames, filenames in os.walk(str(root)):
+                if self._cancel: self.finished.emit(results); return
+                dir_count += 1
+                for fname in filenames:
+                    all_files.append(Path(dirpath) / fname)
+                if dir_count % 50 == 0:
+                    self.status.emit(f"Enumerating: {len(all_files):,} files in {dir_count:,} folders...")
+                    self.current_file.emit(f"Scanning folder: {os.path.basename(dirpath)}", 0, 0)
+                if not self.recursive:
+                    break  # only top-level folder
+
             total = len(all_files)
-            self.log.emit(f"Found {total} files, reading DICOM headers...")
+            self.log.emit(f"Found {total:,} files in {dir_count:,} folders, reading DICOM headers...")
             dc = sk = 0
             for i, fpath in enumerate(all_files):
                 if self._cancel: self.finished.emit(results); return
                 self.progress.emit(i + 1, total)
-                if (i + 1) % 500 == 0: self.status.emit(f"Scanning {i+1}/{total}...")
+                # Emit current file for live display
+                try:
+                    rel = fpath.relative_to(root)
+                except ValueError:
+                    rel = fpath.name
+                self.current_file.emit(str(rel), dc, sk)
+                if (i + 1) % 100 == 0:
+                    self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM | {sk:,} skipped")
                 try:
                     ds = pydicom.dcmread(str(fpath), stop_before_pixels=True, force=True)
                     if not hasattr(ds, 'SOPClassUID'): sk += 1; continue
@@ -416,9 +476,9 @@ class ScannerThread(QThread):
                         'file_size': fpath.stat().st_size,
                     })
                     dc += 1
-                    if dc % 500 == 0: self.log.emit(f"  {dc} DICOM files parsed...")
+                    if dc % 1000 == 0: self.log.emit(f"  {dc:,} DICOM files parsed...")
                 except: sk += 1
-            self.log.emit(f"Scan complete: {dc} DICOM, {sk} skipped (all read-only)")
+            self.log.emit(f"Scan complete: {dc:,} DICOM, {sk:,} skipped (all read-only)")
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(f"Scan failed: {e}\n{traceback.format_exc()}")
@@ -437,12 +497,14 @@ class UploadThread(QThread):
     speed_update = pyqtSignal(float, float)
 
     def __init__(self, files, host, port, ae_scu, ae_scp,
-                 max_pdu=0, batch_size=50, retry_count=1, manifest=None):
+                 max_pdu=0, batch_size=50, retry_count=1, manifest=None, decompress_fallback=True):
         super().__init__()
         self.files = files; self.host = host; self.port = port
         self.ae_scu = ae_scu; self.ae_scp = ae_scp
         self.max_pdu = max_pdu; self.batch_size = batch_size
         self.retry_count = retry_count; self.manifest = manifest
+        self.decompress_fallback = decompress_fallback
+        self.failure_reasons = defaultdict(int)  # reason -> count
         self._cancel = False; self._paused = False
         self._pause_event = threading.Event(); self._pause_event.set()
 
@@ -505,23 +567,27 @@ class UploadThread(QThread):
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'skipped', 'Missing SOP UIDs')
                                 self.progress.emit(file_index, total); continue
 
-                            st = assoc.send_c_store(ds)
-                            if st:
-                                sv = st.Status
-                                if sv == 0x0000 or sv in (0xFF00, 0xFF01):
-                                    sent += 1; bytes_sent += f.get('file_size', 0)
-                                    msg = "Copied" if sv == 0 else f"Pending (0x{sv:04X})"
-                                    self.file_sent.emit(fpath, True, msg, sop)
-                                    if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
-                                else:
-                                    failed += 1; msg = f"Status: 0x{sv:04X}"
-                                    self.file_sent.emit(fpath, False, msg, sop)
-                                    if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                            sv, detail, was_decompressed = try_send_c_store(
+                                assoc, ds, fpath, self.decompress_fallback,
+                                log_fn=self.log.emit)
+                            if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                                sent += 1; bytes_sent += f.get('file_size', 0)
+                                msg = ("Decompressed + Copied" if was_decompressed else "Copied") if sv == 0 else f"Pending (0x{sv:04X})"
+                                self.file_sent.emit(fpath, True, msg, sop)
+                                if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                            elif sv is not None and sv >= 0:
+                                failed += 1; msg = f"Status: 0x{sv:04X}"
+                                self.file_sent.emit(fpath, False, msg, sop)
+                                self.failure_reasons[msg] += 1
+                                if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
                             else:
-                                failed += 1; self.file_sent.emit(fpath, False, "No response", sop)
-                                if self.manifest: self.manifest.record_file(sop, fpath, 'failed', 'No response')
+                                failed += 1; msg = detail or "No response"
+                                self.file_sent.emit(fpath, False, msg, sop)
+                                self.failure_reasons[msg[:80]] += 1
+                                if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg)
                         except Exception as e:
                             failed += 1; self.file_sent.emit(fpath, False, str(e), sop)
+                            self.failure_reasons[str(e)[:80]] += 1
                             if self.manifest: self.manifest.record_file(sop, fpath, 'failed', str(e))
 
                         self.progress.emit(file_index, total)
@@ -550,12 +616,222 @@ class UploadThread(QThread):
         self.log.emit(f"Migration Complete (COPY-ONLY)")
         self.log.emit(f"  Copied: {sent} | Failed: {failed} | Skipped: {skipped}")
         self.log.emit(f"  Time: {elapsed:.1f}s | Source: 0 modified, 0 deleted")
+        if self.failure_reasons:
+            self.log.emit(f"\nFailure Summary:")
+            for reason, count in sorted(self.failure_reasons.items(), key=lambda x: -x[1]):
+                self.log.emit(f"  [{count:,}x] {reason}")
         self.log.emit(f"{'='*60}")
         self.finished.emit(sent, failed, skipped)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# C-ECHO Thread
+# Streaming Migration Thread — Walk + Read + Send in one pass, per-directory
+# No pre-scan or enumeration required. Starts sending immediately.
+# ═══════════════════════════════════════════════════════════════════════════════
+class StreamingMigrationThread(QThread):
+    file_sent = pyqtSignal(str, bool, str, str)  # path, success, message, sop_uid
+    finished = pyqtSignal(int, int, int)          # sent, failed, skipped
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+    status = pyqtSignal(str)
+    speed_update = pyqtSignal(float, float)
+    folder_status = pyqtSignal(str, int, int, int, int)  # folder, dirs_done, sent, failed, skipped
+
+    def __init__(self, root_folder, host, port, ae_scu, ae_scp,
+                 max_pdu=0, batch_size=50, retry_count=1, manifest=None, recursive=True, decompress_fallback=True):
+        super().__init__()
+        self.root_folder = root_folder
+        self.host = host; self.port = port
+        self.ae_scu = ae_scu; self.ae_scp = ae_scp
+        self.max_pdu = max_pdu; self.batch_size = batch_size
+        self.retry_count = retry_count; self.manifest = manifest
+        self.recursive = recursive; self.decompress_fallback = decompress_fallback
+        self.failure_reasons = defaultdict(int)
+        self._cancel = False; self._paused = False
+        self._pause_event = threading.Event(); self._pause_event.set()
+
+    def cancel(self): self._cancel = True; self._pause_event.set()
+    def pause(self): self._paused = True; self._pause_event.clear()
+    def resume(self): self._paused = False; self._pause_event.set()
+
+    def _build_ae(self, sop_classes):
+        ae = AE(ae_title=self.ae_scu); ae.maximum_pdu_size = self.max_pdu
+        added = set()
+        for uid in sop_classes:
+            if uid not in added and len(added) < 126:
+                ae.add_requested_context(uid, TRANSFER_SYNTAXES); added.add(uid)
+        ae.add_requested_context(Verification); return ae
+
+    def _send_batch(self, batch, sent, failed, skipped, bytes_sent, start_time):
+        """Send a batch of parsed DICOM file dicts. Returns updated counters."""
+        sop_classes = list(set(f['sop_class_uid'] for f in batch))
+        ae = self._build_ae(sop_classes)
+
+        for attempt in range(self.retry_count + 1):
+            if self._cancel: return sent, failed, skipped, bytes_sent
+            try:
+                assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp)
+                if not assoc.is_established:
+                    if attempt < self.retry_count:
+                        self.log.emit(f"Association failed, retry {attempt+1}..."); time.sleep(2); continue
+                    for f in batch:
+                        failed += 1; sop = f.get('sop_instance_uid', '')
+                        self.file_sent.emit(f['path'], False, "Association failed", sop)
+                        if self.manifest: self.manifest.record_file(sop, f['path'], 'failed', 'Association failed',
+                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                    return sent, failed, skipped, bytes_sent
+
+                for f in batch:
+                    self._pause_event.wait()
+                    if self._cancel: assoc.release(); return sent, failed, skipped, bytes_sent
+                    fpath = f['path']; sop = f.get('sop_instance_uid', '')
+
+                    # Resume: skip already sent
+                    if self.manifest and self.manifest.is_already_sent(sop):
+                        skipped += 1
+                        self.file_sent.emit(fpath, True, "Already sent (resumed)", sop)
+                        continue
+
+                    try:
+                        ds = pydicom.dcmread(fpath, force=True)
+                        if not hasattr(ds, 'SOPClassUID') or not hasattr(ds, 'SOPInstanceUID'):
+                            skipped += 1; self.file_sent.emit(fpath, False, "Missing SOP UIDs", sop)
+                            if self.manifest: self.manifest.record_file(sop, fpath, 'skipped', 'Missing SOP UIDs')
+                            continue
+
+                        sv, detail, was_decompressed = try_send_c_store(
+                            assoc, ds, fpath, self.decompress_fallback,
+                            log_fn=self.log.emit)
+                        if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                            sent += 1; bytes_sent += f.get('file_size', 0)
+                            msg = ("Decompressed + Copied" if was_decompressed else "Copied") if sv == 0 else f"Pending (0x{sv:04X})"
+                            self.file_sent.emit(fpath, True, msg, sop)
+                            if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg,
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                        elif sv is not None and sv >= 0:
+                            failed += 1; msg = f"Status: 0x{sv:04X}"
+                            self.file_sent.emit(fpath, False, msg, sop)
+                            self.failure_reasons[msg] += 1
+                            if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                        else:
+                            failed += 1; msg = detail or "No response"
+                            self.file_sent.emit(fpath, False, msg, sop)
+                            self.failure_reasons[msg[:80]] += 1
+                            if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg)
+                    except Exception as e:
+                        failed += 1; self.file_sent.emit(fpath, False, str(e), sop)
+                        self.failure_reasons[str(e)[:80]] += 1
+                        if self.manifest: self.manifest.record_file(sop, fpath, 'failed', str(e))
+
+                    elapsed = time.time() - start_time
+                    total_proc = sent + failed + skipped
+                    if elapsed > 0 and total_proc > 0:
+                        self.speed_update.emit(total_proc / elapsed, (bytes_sent / (1024*1024)) / elapsed)
+
+                try: assoc.release()
+                except: pass
+                break
+            except Exception as e:
+                if attempt < self.retry_count:
+                    self.log.emit(f"Error: {e}, retrying..."); time.sleep(2)
+                else:
+                    self.log.emit(f"Batch failed: {e}")
+                    for f in batch:
+                        failed += 1
+                        self.file_sent.emit(f['path'], False, str(e), f.get('sop_instance_uid', ''))
+                    break
+
+        return sent, failed, skipped, bytes_sent
+
+    def run(self):
+        sent = failed = skipped = 0; bytes_sent = 0
+        start_time = time.time(); dirs_done = 0
+        root = self.root_folder
+
+        self.log.emit(f"{'='*60}")
+        self.log.emit(f"STREAMING MIGRATION (COPY-ONLY)")
+        self.log.emit(f"{DATA_SAFETY_NOTICE}")
+        self.log.emit(f"{'='*60}")
+        self.log.emit(f"Source: {root}")
+        self.log.emit(f"Destination: {self.host}:{self.port}")
+        self.log.emit(f"Walking directory tree and sending immediately...")
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            if self._cancel: break
+            if not self.recursive and dirpath != root:
+                continue
+
+            if not filenames:
+                continue
+
+            # Show which folder we're processing
+            try:
+                rel_dir = os.path.relpath(dirpath, root)
+            except ValueError:
+                rel_dir = dirpath
+            if rel_dir == '.': rel_dir = os.path.basename(root)
+
+            dirs_done += 1
+            self.folder_status.emit(rel_dir, dirs_done, sent, failed, skipped)
+            self.status.emit(f"Folder {dirs_done}: {rel_dir} ({len(filenames)} files)")
+
+            # Parse DICOM headers for this directory (read-only, headers only)
+            dir_files = []
+            for fname in filenames:
+                if self._cancel: break
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
+                    if not hasattr(ds, 'SOPClassUID'):
+                        continue
+                    dir_files.append({
+                        'path': fpath,
+                        'patient_name': str(getattr(ds, 'PatientName', 'Unknown')),
+                        'patient_id': str(getattr(ds, 'PatientID', 'N/A')),
+                        'study_date': str(getattr(ds, 'StudyDate', '')),
+                        'study_desc': str(getattr(ds, 'StudyDescription', '')),
+                        'modality': str(getattr(ds, 'Modality', 'OT')),
+                        'sop_class_uid': str(ds.SOPClassUID),
+                        'sop_instance_uid': str(getattr(ds, 'SOPInstanceUID', '')),
+                        'study_instance_uid': str(getattr(ds, 'StudyInstanceUID', '')),
+                        'series_instance_uid': str(getattr(ds, 'SeriesInstanceUID', '')),
+                        'file_size': os.path.getsize(fpath),
+                    })
+                except:
+                    pass  # not a DICOM file
+
+            if not dir_files:
+                continue
+
+            if dirs_done <= 3 or dirs_done % 25 == 0:
+                self.log.emit(f"  [{dirs_done}] {rel_dir}: {len(dir_files)} DICOM files")
+
+            # Send this directory's files in batches
+            for batch_start in range(0, len(dir_files), self.batch_size):
+                if self._cancel: break
+                batch = dir_files[batch_start:batch_start + self.batch_size]
+                sent, failed, skipped, bytes_sent = self._send_batch(
+                    batch, sent, failed, skipped, bytes_sent, start_time)
+
+            # Save manifest periodically
+            if self.manifest and dirs_done % 10 == 0:
+                self.manifest.save()
+
+        if self.manifest: self.manifest.save()
+        elapsed = time.time() - start_time
+        self.log.emit(f"\n{'='*60}")
+        self.log.emit(f"Streaming Migration Complete (COPY-ONLY)")
+        self.log.emit(f"  Folders: {dirs_done} | Copied: {sent:,} | Failed: {failed:,} | Skipped: {skipped:,}")
+        self.log.emit(f"  Time: {elapsed:.1f}s | Source: 0 modified, 0 deleted")
+        if bytes_sent > 0:
+            self.log.emit(f"  Data: {bytes_sent/(1024**3):.2f} GB | Avg: {(bytes_sent/(1024**2))/elapsed:.1f} MB/s" if elapsed > 0 else "")
+        if self.failure_reasons:
+            self.log.emit(f"\nFailure Summary:")
+            for reason, count in sorted(self.failure_reasons.items(), key=lambda x: -x[1]):
+                self.log.emit(f"  [{count:,}x] {reason}")
+        self.log.emit(f"{'='*60}")
+        self.finished.emit(sent, failed, skipped)
 # ═══════════════════════════════════════════════════════════════════════════════
 class EchoThread(QThread):
     result = pyqtSignal(bool, str)
@@ -766,10 +1042,11 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 750); self.resize(1280, 850)
         self.settings = QSettings("DICOMMigrator", "DICOMMigrator")
         self.dicom_files = []; self.manifest = MigrationManifest()
-        self.scanner_thread = self.upload_thread = self.verify_thread = None
+        self.scanner_thread = self.upload_thread = self.verify_thread = self.streaming_thread = None
         self.scan_start_time = self.upload_start_time = None
         self._sent = self._failed = self._skipped = 0
         self._upload_results = []  # (path, success, message, sop_uid) for retry
+        self._streaming_mode = False
         self._build_ui(); self._load_settings()
 
     def _build_ui(self):
@@ -808,12 +1085,22 @@ class MainWindow(QMainWindow):
         self.recursive_check = QCheckBox("Scan subfolders recursively"); self.recursive_check.setChecked(True)
         sl.addWidget(self.recursive_check, 1, 0, 1, 2)
         self.scan_btn = QPushButton("Scan for DICOM Files"); self.scan_btn.setStyleSheet("font-size: 14px; padding: 10px 24px;")
-        self.scan_btn.clicked.connect(self._start_scan); sl.addWidget(self.scan_btn, 2, 0, 1, 3)
+        self.scan_btn.clicked.connect(self._start_scan); sl.addWidget(self.scan_btn, 2, 0, 1, 2)
+        self.stream_btn = QPushButton("Stream Migrate Entire Store")
+        self.stream_btn.setStyleSheet("background-color: #a6e3a1; color: #1e1e2e; font-size: 14px; padding: 10px 24px; font-weight: bold;")
+        self.stream_btn.setToolTip("Walk + Read + Send per-folder in one pass. No pre-scan needed.\nStarts sending immediately — ideal for large image stores.")
+        self.stream_btn.clicked.connect(self._start_streaming); sl.addWidget(self.stream_btn, 2, 2)
         self.scan_progress = QProgressBar(); self.scan_progress.setVisible(False); sl.addWidget(self.scan_progress, 3, 0, 1, 3)
+
+        # Live scan activity display
+        self.scan_activity_lbl = QLabel(""); self.scan_activity_lbl.setStyleSheet("color: #89b4fa; font-family: 'Consolas', monospace; font-size: 11px;")
+        self.scan_activity_lbl.setWordWrap(True); sl.addWidget(self.scan_activity_lbl, 4, 0, 1, 3)
+        self.scan_stats_lbl = QLabel(""); self.scan_stats_lbl.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 12px;")
+        sl.addWidget(self.scan_stats_lbl, 5, 0, 1, 3)
 
         # Resume info
         self.resume_label = QLabel(""); self.resume_label.setStyleSheet("color: #f9e2af; font-size: 11px;")
-        sl.addWidget(self.resume_label, 4, 0, 1, 3)
+        sl.addWidget(self.resume_label, 6, 0, 1, 3)
         layout.addWidget(sg)
 
         dg = QGroupBox("Destination PACS Server"); dl = QGridLayout(dg)
@@ -844,6 +1131,14 @@ class MainWindow(QMainWindow):
         self.retry_spin = QSpinBox(); self.retry_spin.setRange(0, 10); self.retry_spin.setValue(2); al.addWidget(self.retry_spin, 0, 3)
         al.addWidget(QLabel("Max PDU:"), 1, 0)
         self.pdu_combo = QComboBox(); self.pdu_combo.addItems(["0 (Unlimited)", "16384", "32768", "65536", "131072"]); al.addWidget(self.pdu_combo, 1, 1)
+        self.manifest_check = QCheckBox("Save resume manifest to source folder (enables crash recovery)")
+        self.manifest_check.setChecked(True)
+        self.manifest_check.setToolTip("When disabled, no files are written to the DICOM source folder.\nResume and retry still work within the current session, but not across restarts.\nCSV export is always available regardless of this setting.")
+        al.addWidget(self.manifest_check, 2, 0, 1, 4)
+        self.decompress_check = QCheckBox("Decompress before sending if destination rejects compressed syntax")
+        self.decompress_check.setChecked(True)
+        self.decompress_check.setToolTip("When a PACS rejects JPEG/JPEG2000/RLE compressed files,\nautomatically decompress to Explicit VR Little Endian in memory and retry.\nSource files are never modified — decompression is in-memory only.")
+        al.addWidget(self.decompress_check, 3, 0, 1, 4)
         layout.addWidget(ag); layout.addStretch(); return w
 
     # ─── Browser Tab with Filtering ───────────────────────────────────────
@@ -928,6 +1223,9 @@ class MainWindow(QMainWindow):
 
         pg = QGroupBox("Progress"); pl = QVBoxLayout(pg)
         self.upload_progress = QProgressBar(); self.upload_progress.setMinimumHeight(28); pl.addWidget(self.upload_progress)
+        # Streaming folder status
+        self.stream_folder_lbl = QLabel(""); self.stream_folder_lbl.setStyleSheet("color: #89b4fa; font-family: 'Consolas', monospace; font-size: 11px;")
+        self.stream_folder_lbl.setWordWrap(True); self.stream_folder_lbl.setVisible(False); pl.addWidget(self.stream_folder_lbl)
         ir = QHBoxLayout()
         self.upload_count_lbl = QLabel("0 / 0 files"); ir.addWidget(self.upload_count_lbl); ir.addStretch()
         self.upload_speed_lbl = QLabel(""); ir.addWidget(self.upload_speed_lbl); ir.addStretch()
@@ -1007,25 +1305,35 @@ class MainWindow(QMainWindow):
         if not folder or not os.path.isdir(folder): self._log("Invalid folder path"); return
         self.dicom_files.clear(); self.file_tree.clear()
         self.scan_btn.setEnabled(False); self.scan_progress.setVisible(True); self.scan_progress.setValue(0)
+        self.scan_activity_lbl.setText("Enumerating files..."); self.scan_stats_lbl.setText("")
         self.scan_start_time = time.time()
 
-        # Load or create manifest for resume support
-        self.manifest = MigrationManifest()
-        self.manifest.set_path_from_folder(folder)
-        if self.manifest.load():
-            sc = self.manifest.get_sent_count()
-            self.resume_label.setText(f"Resume manifest found: {sc} files already sent. These will be skipped automatically.")
-            self._log(f"Loaded manifest: {sc} previously sent files will be skipped")
+        # Load or create manifest for resume support (only if enabled)
+        manifest_enabled = self.manifest_check.isChecked()
+        self.manifest = MigrationManifest(save_to_disk=manifest_enabled)
+        if manifest_enabled:
+            self.manifest.set_path_from_folder(folder)
+            if self.manifest.load():
+                sc = self.manifest.get_sent_count()
+                self.resume_label.setText(f"Resume manifest found: {sc} files already sent. These will be skipped automatically.")
+                self._log(f"Loaded manifest: {sc} previously sent files will be skipped")
+            else:
+                self.resume_label.setText("")
         else:
-            self.resume_label.setText("")
+            self.resume_label.setText("Manifest disabled — no files written to source folder")
 
         self.scanner_thread = ScannerThread(folder, self.recursive_check.isChecked())
         self.scanner_thread.progress.connect(self._on_scan_progress)
+        self.scanner_thread.current_file.connect(self._on_scan_file)
         self.scanner_thread.log.connect(self._log)
         self.scanner_thread.finished.connect(self._on_scan_complete)
         self.scanner_thread.error.connect(lambda e: self._log(f"ERROR: {e}"))
         self.scanner_thread.status.connect(self.statusBar().showMessage)
         self.scanner_thread.start()
+
+    def _on_scan_file(self, filename, dc, sk):
+        self.scan_activity_lbl.setText(f"Reading: {filename}")
+        self.scan_stats_lbl.setText(f"DICOM: {dc:,}  |  Skipped: {sk:,}")
 
     def _on_scan_progress(self, c, t):
         if t > 0: self.scan_progress.setMaximum(t); self.scan_progress.setValue(c)
@@ -1034,7 +1342,9 @@ class MainWindow(QMainWindow):
         self.dicom_files = files
         self.scan_btn.setEnabled(True); self.scan_progress.setVisible(False)
         elapsed = time.time() - self.scan_start_time if self.scan_start_time else 0
-        self._log(f"Scan: {elapsed:.1f}s, {len(files)} DICOM files (read-only)")
+        self._log(f"Scan: {elapsed:.1f}s, {len(files):,} DICOM files (read-only)")
+        self.scan_activity_lbl.setText(f"Scan complete in {elapsed:.1f}s")
+        self.scan_stats_lbl.setText(f"{len(files):,} DICOM files found")
 
         # Mark resume status
         if self.manifest.records:
@@ -1218,6 +1528,7 @@ class MainWindow(QMainWindow):
         self.upload_table.setRowCount(0); self.upload_progress.setValue(0)
         self.upload_progress.setMaximum(len(files_to_send))
         self._sent = self._failed = self._skipped = 0; self._upload_results = []
+        self._streaming_mode = False
         self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0"); self.skipped_label.setText("Skipped: 0")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted")
         self.upload_speed_lbl.setText(""); self.upload_eta_lbl.setText("")
@@ -1233,7 +1544,8 @@ class MainWindow(QMainWindow):
             self.ae_scp.text().strip() or "ANY-SCP",
             int(self.pdu_combo.currentText().split(" ")[0]),
             self.batch_spin.value(), self.retry_spin.value(),
-            manifest=self.manifest)
+            manifest=self.manifest,
+            decompress_fallback=self.decompress_check.isChecked())
         self.upload_thread.progress.connect(self._on_upload_progress)
         self.upload_thread.file_sent.connect(self._on_file_sent)
         self.upload_thread.finished.connect(self._on_upload_complete)
@@ -1243,6 +1555,83 @@ class MainWindow(QMainWindow):
         self.upload_thread.speed_update.connect(self._on_speed)
         self.upload_thread.start()
         self.tabs.setCurrentIndex(2)
+        self.stream_folder_lbl.setVisible(False)
+
+    def _start_streaming(self):
+        """Stream migrate: walk + read + send per-directory, no pre-scan."""
+        folder = self.folder_input.text().strip()
+        if not folder or not os.path.isdir(folder):
+            self._log("Enter a valid DICOM folder path"); return
+        host = self.host_input.text().strip()
+        if not host:
+            self._log("Enter a destination host/IP"); return
+        self._save_settings()
+
+        # Set up manifest
+        manifest_enabled = self.manifest_check.isChecked()
+        self.manifest = MigrationManifest(save_to_disk=manifest_enabled)
+        if manifest_enabled:
+            self.manifest.set_path_from_folder(folder)
+            if self.manifest.load():
+                sc = self.manifest.get_sent_count()
+                self._log(f"Loaded manifest: {sc:,} previously sent files will be skipped")
+        self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
+
+        # Reset upload UI
+        self.upload_table.setRowCount(0)
+        self.upload_progress.setRange(0, 0)  # Indeterminate pulsing bar
+        self._sent = self._failed = self._skipped = 0; self._upload_results = []
+        self._streaming_mode = True
+        self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0"); self.skipped_label.setText("Skipped: 0")
+        self.source_safe_lbl.setText("Source: 0 modified, 0 deleted")
+        self.upload_speed_lbl.setText(""); self.upload_eta_lbl.setText("")
+        self.upload_count_lbl.setText("Streaming...")
+        self.stream_folder_lbl.setVisible(True); self.stream_folder_lbl.setText("Starting...")
+
+        self.upload_btn.setEnabled(False); self.stream_btn.setEnabled(False)
+        self.scan_btn.setEnabled(False); self.retry_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True); self.cancel_btn.setEnabled(True)
+        self.export_csv_btn.setEnabled(False)
+        self.upload_start_time = time.time()
+
+        self.streaming_thread = StreamingMigrationThread(
+            folder, host, self.port_input.value(),
+            self.ae_scu.text().strip() or "DICOM_MIGRATOR",
+            self.ae_scp.text().strip() or "ANY-SCP",
+            int(self.pdu_combo.currentText().split(" ")[0]),
+            self.batch_spin.value(), self.retry_spin.value(),
+            manifest=self.manifest,
+            recursive=self.recursive_check.isChecked(),
+            decompress_fallback=self.decompress_check.isChecked())
+        self.streaming_thread.file_sent.connect(self._on_file_sent)
+        self.streaming_thread.finished.connect(self._on_streaming_complete)
+        self.streaming_thread.error.connect(lambda e: self._log(f"ERROR: {e}"))
+        self.streaming_thread.log.connect(self._log)
+        self.streaming_thread.status.connect(self.statusBar().showMessage)
+        self.streaming_thread.speed_update.connect(self._on_speed)
+        self.streaming_thread.folder_status.connect(self._on_folder_status)
+        self.streaming_thread.start()
+        self.tabs.setCurrentIndex(2)
+
+    def _on_folder_status(self, folder, dirs_done, sent, failed, skipped):
+        self.stream_folder_lbl.setText(f"Folder: {folder}")
+        total = sent + failed + skipped
+        self.upload_count_lbl.setText(f"{total:,} files processed | {dirs_done:,} folders")
+        elapsed = time.time() - self.upload_start_time if self.upload_start_time else 0
+        if elapsed > 60:
+            self.upload_eta_lbl.setText(f"Elapsed: {elapsed/3600:.1f}h" if elapsed > 3600 else f"Elapsed: {elapsed/60:.0f}m {elapsed%60:.0f}s")
+
+    def _on_streaming_complete(self, sent, failed, skipped):
+        self.upload_btn.setEnabled(True); self.stream_btn.setEnabled(True); self.scan_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False); self.cancel_btn.setEnabled(False)
+        self.export_csv_btn.setEnabled(True)
+        self.upload_progress.setRange(0, 1); self.upload_progress.setValue(1)  # Full bar
+        self._streaming_mode = False
+        self.stream_folder_lbl.setText("Stream migration complete")
+        self.retry_btn.setEnabled(failed > 0)
+        self.statusBar().showMessage(f"Complete - Copied: {sent:,}, Failed: {failed:,}, Skipped: {skipped:,} | Source: UNTOUCHED")
+        self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
+        if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
 
     def _retry_failed(self):
         """Retry only files that failed in the last run."""
@@ -1285,23 +1674,26 @@ class MainWindow(QMainWindow):
     def _on_speed(self, fps, mbps): self.upload_speed_lbl.setText(f"{fps:.1f} files/s | {mbps:.2f} MB/s")
 
     def _on_upload_complete(self, sent, failed, skipped):
-        self.upload_btn.setEnabled(True); self.pause_btn.setEnabled(False); self.cancel_btn.setEnabled(False)
+        self.upload_btn.setEnabled(True); self.stream_btn.setEnabled(True); self.scan_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False); self.cancel_btn.setEnabled(False)
         self.export_csv_btn.setEnabled(True)
         self.retry_btn.setEnabled(failed > 0)
         self.statusBar().showMessage(f"Complete - Copied: {sent}, Failed: {failed}, Skipped: {skipped} | Source: UNTOUCHED")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
-        if self.manifest.path: self._log(f"Manifest saved: {self.manifest.path}")
+        if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
 
     def _toggle_pause(self):
-        if not self.upload_thread: return
-        if self.upload_thread._paused:
-            self.upload_thread.resume(); self.pause_btn.setText("Pause"); self._log("Resumed")
+        thread = self.streaming_thread if self._streaming_mode else self.upload_thread
+        if not thread: return
+        if thread._paused:
+            thread.resume(); self.pause_btn.setText("Pause"); self._log("Resumed")
         else:
-            self.upload_thread.pause(); self.pause_btn.setText("Resume"); self._log("Paused")
+            thread.pause(); self.pause_btn.setText("Resume"); self._log("Paused")
 
     def _cancel_upload(self):
-        if self.upload_thread:
-            self.upload_thread.cancel(); self._log("Cancelled - source files untouched")
+        thread = self.streaming_thread if self._streaming_mode else self.upload_thread
+        if thread:
+            thread.cancel(); self._log("Cancelled - source files untouched")
 
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Migration Manifest", f"migration_manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "CSV Files (*.csv)")
@@ -1371,6 +1763,8 @@ class MainWindow(QMainWindow):
         s.setValue("port", self.port_input.value()); s.setValue("ae_scu", self.ae_scu.text())
         s.setValue("ae_scp", self.ae_scp.text()); s.setValue("batch", self.batch_spin.value())
         s.setValue("retry", self.retry_spin.value()); s.setValue("recursive", self.recursive_check.isChecked())
+        s.setValue("manifest_enabled", self.manifest_check.isChecked())
+        s.setValue("decompress_fallback", self.decompress_check.isChecked())
 
     def _load_settings(self):
         s = self.settings
@@ -1383,6 +1777,10 @@ class MainWindow(QMainWindow):
         r = s.value("retry"); self.retry_spin.setValue(int(r)) if r else None
         rc = s.value("recursive")
         if rc is not None: self.recursive_check.setChecked(rc == "true" or rc is True)
+        mc = s.value("manifest_enabled")
+        if mc is not None: self.manifest_check.setChecked(mc == "true" or mc is True)
+        dc = s.value("decompress_fallback")
+        if dc is not None: self.decompress_check.setChecked(dc == "true" or dc is True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
