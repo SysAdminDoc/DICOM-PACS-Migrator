@@ -32,14 +32,14 @@ powershell -ExecutionPolicy Bypass -File Build-DICOMPACSMigrator.ps1
 | Feature | Description | Tab |
 |---------|-------------|-----|
 | **Streaming Migration** | Walk + Read + Send per-folder in one pass — starts sending immediately with no pre-scan. Ideal for large image stores with 35,000+ studies | Configuration |
-| **Decompress Fallback** | Automatically decompresses JPEG/JPEG2000/RLE to Explicit VR Little Endian in memory when destination rejects compressed syntax. Source files never modified | Advanced |
+| **Decompress Fallback** | Automatically decompresses JPEG/JPEG2000/RLE/JPEG Lossless to uncompressed transfer syntax in memory when destination rejects compressed syntax. Handles transfer syntax negotiation, pixel-less objects, and codec edge cases. Source files never modified | Advanced |
 | **Resume Support** | JSON manifest tracks every file by SOP Instance UID — resume after crash, skip already-sent files on re-run | Upload |
 | **Retry Failed** | One-click retry of only failed files without re-sending successful ones | Upload |
 | **Post-Migration Verification** | C-FIND queries destination PACS to confirm studies arrived with correct file counts | Verify |
 | **Filtering** | Filter by patient name/ID, modality, date range before sending | File Browser |
 | **Checkbox Selection** | Select/deselect individual patients, studies, or series for granular upload control | File Browser |
 | **Per-File Error Detail** | Every file shows individual status, error message, and SOP UID in results table | Upload |
-| **Failure Summary** | Grouped failure reasons with counts at end of migration — instantly see what the destination rejected | Log |
+| **Failure Summary** | Grouped failure reasons with counts logged at end of migration — instantly see what the destination rejected | Log |
 | **CSV Manifest Export** | Export complete audit trail with patient, status, timestamp for every file sent | Upload |
 | Network Auto-Discovery | Two-phase TCP + C-ECHO scanner finds all DICOM nodes on your network | Configuration |
 | Connection Assistant | Click-to-populate dialog — select a discovered node and settings auto-fill | Configuration |
@@ -71,10 +71,11 @@ powershell -ExecutionPolicy Bypass -File Build-DICOMPACSMigrator.ps1
                     │         C-STORE Send           │
                     │                                │
                     │  1. Try original syntax        │
-                    │  2. If rejected + decompress   │
-                    │     enabled: decompress in     │
-                    │     memory, retry as           │
-                    │     Explicit VR Little Endian  │
+                    │  2. If rejected: decompress    │
+                    │     in memory, open fresh      │
+                    │     association with only       │
+                    │     uncompressed syntaxes,     │
+                    │     match negotiated TS        │
                     │  3. Record to manifest         │
                     └─────────────┬─────────────────┘
                                   │
@@ -126,22 +127,42 @@ Enabled by default in Advanced settings:
 
 > **"Decompress before sending if destination rejects compressed syntax"**
 
-When the destination PACS rejects a compressed file (JPEG Baseline, JPEG 2000, JPEG Lossless, RLE Lossless, etc.), the tool:
+When the destination PACS rejects a compressed file, the tool handles the full negotiation cycle:
 
-1. Catches the "No presentation context" error
-2. Decompresses the dataset to Explicit VR Little Endian **in memory only**
-3. Retries the C-STORE with the uncompressed data
-4. Shows "Decompressed + Copied" in results
+1. **Initial send** on the batch association with all transfer syntaxes proposed
+2. **Catches "No presentation context"** error — the SCP rejected that SOP class + transfer syntax combination
+3. **Decompresses pixel data in memory** using NumPy + Pillow/pylibjpeg codecs
+4. **Opens a fresh association** proposing only Explicit VR Little Endian and Implicit VR Little Endian
+5. **Reads the negotiated transfer syntax** from `accepted_contexts` and stamps the dataset to match exactly what the SCP picked
+6. **Sends on the fresh association** — the SCP receives uncompressed data in its preferred encoding
+7. **Releases the retry association** immediately after the single send
 
-Source files are **never** modified. `ds.decompress()` operates on the in-memory pydicom Dataset object only.
+This handles several real-world edge cases:
 
-For JPEG decompression, `Pillow` is recommended:
+| Scenario | How It's Handled |
+|----------|-----------------|
+| SCP only accepts Implicit VR LE | Fresh association negotiates Implicit; dataset TS is set to match |
+| SCP only accepts Explicit VR LE | Fresh association negotiates Explicit; dataset TS is set to match |
+| File has no pixel data (SR, KOS, PR) | Skips decompression, re-tags as uncompressed, sends on fresh association |
+| Missing codec (rare JPEG format) | Falls through gracefully, reports specific error in failure summary |
+| Duplicate SOP UID on destination | Normal PACS behavior — destination overwrites with identical data, returns Success |
 
-```bash
-pip install Pillow
-```
+Source files are **never** modified. `ds.decompress()` and transfer syntax re-tagging operate on the in-memory pydicom Dataset object only.
 
-Some SOP classes like Encapsulated PDF Storage or Grayscale Softcopy Presentation State may still fail if the destination PACS doesn't support those object types at all. The failure summary at the end groups these by reason so you can see exactly what was rejected.
+### Supported Codecs
+
+| Transfer Syntax | Codec Required |
+|----------------|---------------|
+| JPEG Baseline (8-bit) | Pillow |
+| JPEG Extended (12-bit) | pylibjpeg-libjpeg |
+| JPEG Lossless (SV1) | pylibjpeg-libjpeg |
+| JPEG Lossless | pylibjpeg-libjpeg |
+| JPEG 2000 Lossless | pylibjpeg-openjpeg |
+| JPEG 2000 | pylibjpeg-openjpeg |
+| RLE Lossless | NumPy (built-in to pydicom) |
+| Deflated Explicit VR LE | zlib (Python stdlib) |
+
+All codecs require **NumPy** as a base dependency.
 
 ## Resume Support
 
@@ -166,8 +187,8 @@ At the end of any migration, the log shows grouped failures:
 
 ```
 Failure Summary:
-  [47x] No context + decompress failed: Encapsulated PDF Storage
-  [12x] No context + decompress failed: Grayscale Softcopy Presentation State
+  [47x] Decompress retry assoc rejected for Encapsulated PDF Storage
+  [12x] Decompress retry assoc rejected for Grayscale Softcopy Presentation State
   [3x]  Status: 0xA700
 ```
 
@@ -197,7 +218,7 @@ The copy-only architecture is enforced at every layer:
 |-------|-------------|
 | File Scanner | `pydicom.dcmread(stop_before_pixels=True, force=True)` — read-only |
 | Upload Engine | `pydicom.dcmread()` read-only, `send_c_store()` network-only |
-| Decompress | `ds.decompress()` modifies in-memory Dataset only, never writes to disk |
+| Decompress Fallback | `ds.decompress()` and TS re-tagging modify in-memory Dataset only, never writes to disk |
 | File System | Zero `write()`, `rename()`, `unlink()`, `move()` calls on source files |
 | Streaming | `os.walk()` for directory listing (read-only), same read-only send pipeline |
 | UI | Persistent "COPY-ONLY MODE" badge, per-tab safety reminders |
@@ -247,17 +268,21 @@ The Connection Assistant scans your network in two phases:
 - Downloads and installs Python locally (no admin required)
 - Falls back to embeddable zip if installer fails
 - Pins all dependency versions for reproducible builds
-- Excludes 25+ unused PyQt5 modules to minimize exe size (~40-60 MB)
+- Excludes 25+ unused PyQt5 modules to minimize exe size
 - Output: `dist\DICOMPACSMigrator.exe` — copy to any Windows machine and run
 
 ## Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
+| numpy | latest | Pixel array operations — required by all decompression handlers |
 | PyQt5 | 5.15.10 | GUI framework |
 | pydicom | 2.4.4 | DICOM file parsing |
 | pynetdicom | 2.0.2 | DICOM networking (C-STORE, C-ECHO, C-FIND) |
-| Pillow | (optional) | JPEG decompression for decompress fallback |
+| Pillow | latest | JPEG Baseline decompression |
+| pylibjpeg | latest | JPEG codec framework for pydicom |
+| pylibjpeg-openjpeg | latest | JPEG 2000 decompression |
+| pylibjpeg-libjpeg | latest | JPEG Lossless/Extended decompression |
 | PyInstaller | 5.13.2 | Exe compilation (build only) |
 
 All auto-installed on first run (source) or bundled in the portable exe.
@@ -271,22 +296,31 @@ Yes. Use the green "Stream Migrate Entire Store" button. It walks each directory
 No. Re-run with the same source folder and manifest enabled. Already-sent files are automatically skipped.
 
 **Q: I'm getting "No presentation context" errors for some files.**
-The destination is rejecting certain SOP class + transfer syntax combinations. If "Decompress before sending" is enabled, compressed images will be automatically retried as uncompressed. Objects like Encapsulated PDFs or Presentation States may still fail if the destination doesn't support those types — check the failure summary in the log.
+The destination is rejecting certain SOP class + transfer syntax combinations. If "Decompress before sending" is enabled, compressed images will be automatically decompressed and retried on a fresh association. The tool negotiates the correct uncompressed transfer syntax with the SCP automatically.
+
+**Q: How does the decompress retry actually work?**
+When a compressed file is rejected, the tool: (1) decompresses pixel data in memory, (2) opens a brand new association proposing only uncompressed transfer syntaxes, (3) reads which syntax the SCP actually accepted, (4) stamps the dataset to match, and (5) sends. This handles SCPs that only accept Implicit VR LE, Explicit VR LE, or either.
+
+**Q: I see "Duplicate detected / Will overwrite" in the destination PACS logs.**
+Normal and safe. This happens when the decompressed retry sends the same SOP Instance UID that was partially received on the first attempt. The PACS overwrites with the identical data and returns Success. No data loss.
+
+**Q: Some files fail with "Decompress retry assoc rejected".**
+The destination PACS doesn't support that SOP class at all (not a transfer syntax issue). Common with Encapsulated PDF Storage, Grayscale Softcopy Presentation State, and other non-image objects. These need to be enabled on the destination PACS configuration, or accepted as non-transferable.
+
+**Q: Files fail with "Unable to convert the pixel data".**
+These are metadata-only objects (structured reports, key object selections) with a compressed transfer syntax in the header but no actual pixel data. The tool handles this automatically by re-tagging and sending on an uncompressed association.
 
 **Q: How do I know my source files weren't modified?**
-The log prints "Source: 0 modified, 0 deleted — ALL ORIGINALS INTACT" after every run. The codebase contains zero file-write operations on source paths. Decompression is in-memory only.
+The log prints "Source: 0 modified, 0 deleted — ALL ORIGINALS INTACT" after every run. The codebase contains zero file-write operations on source paths. Decompression and transfer syntax re-tagging are in-memory only.
 
 **Q: C-FIND verification shows MISMATCH — what do I do?**
-Common causes: rejected SOP classes, deduplication on the destination, or JPEG files the destination couldn't store. Check the Upload tab results for per-file errors, use the failure summary to identify patterns, then use Retry Failed.
+Common causes: rejected SOP classes, deduplication on the destination, or files the destination couldn't store. Check the Upload tab results for per-file errors, use the failure summary to identify patterns, then use Retry Failed.
 
-**Q: What about Encapsulated PDFs and Presentation State objects that keep failing?**
-These aren't diagnostic images — they're embedded documents and display presets. If the destination PACS doesn't support them, they can't be sent via DICOM. You may need to configure the destination to accept those SOP classes, or accept that those non-image objects won't transfer.
-
-**Q: How do I add Pillow for JPEG decompression?**
+**Q: How do I install the decompression codecs manually?**
 ```bash
-pip install Pillow
+pip install numpy Pillow pylibjpeg pylibjpeg-openjpeg pylibjpeg-libjpeg
 ```
-Or add `'Pillow'` to the `required` list in the bootstrap function and the build script's dependencies.
+The compiled .exe bundles all of these automatically.
 
 ## License
 
