@@ -8,7 +8,7 @@
 
 > Bulk DICOM C-STORE migration tool with streaming migration, network auto-discovery, crash-safe resume, automatic decompression fallback, post-migration verification, and audit trail. Copy-only architecture — source data is **never** modified or deleted.
 
-![Screenshot](screenshot.png)
+<img width="1529" height="1045" alt="image" src="https://github.com/user-attachments/assets/63ff1b80-8999-4338-962e-e55d308a0b19" />
 
 ## Quick Start
 
