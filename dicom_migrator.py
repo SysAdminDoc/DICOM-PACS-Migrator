@@ -15,7 +15,7 @@ def _bootstrap():
         return
     if sys.version_info < (3, 8):
         print("Python 3.8+ required"); sys.exit(1)
-    required = ['PyQt5', 'pydicom', 'pynetdicom', 'Pillow']
+    required = ['numpy', 'PyQt5', 'pydicom', 'pynetdicom', 'Pillow', 'pylibjpeg', 'pylibjpeg-openjpeg', 'pylibjpeg-libjpeg']
     for pkg in required:
         mod = pkg.lower().replace('-', '_')
         try:

@@ -28,10 +28,14 @@ $PythonMajorMin  = "38"
 # Pinned dependency versions known to work with Python 3.8 + Server 2008
 # 3.8.10 is the LAST Python 3.8 release with official Windows binaries
 $Dependencies = @(
+    "numpy",
     "PyQt5==5.15.10",
     "pydicom==2.4.4",
     "pynetdicom==2.0.2",
     "Pillow",
+    "pylibjpeg",
+    "pylibjpeg-openjpeg",
+    "pylibjpeg-libjpeg",
     "PyInstaller==5.13.2"
 )
 
@@ -415,7 +419,6 @@ $piArgs = @(
     # Exclude bloat - general
     "--exclude-module", "tkinter",
     "--exclude-module", "matplotlib",
-    "--exclude-module", "numpy",
     "--exclude-module", "scipy",
     "--exclude-module", "cv2",
     "--exclude-module", "unittest",
