@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v0.4.0
+DICOM PACS Migrator v0.5.0
 Bulk DICOM C-STORE migration tool with network auto-discovery,
 resume support, post-migration verification, filtering, streaming
-migration, decompress fallback, and audit trail.
+migration, decompress fallback, patient ID conflict retry, and audit trail.
 Copy-only architecture — source data is NEVER modified or deleted.
 """
 
@@ -60,7 +60,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "0.4.0"
+VERSION = "0.6.0"
 APP_NAME = "DICOM PACS Migrator"
 
 DATA_SAFETY_NOTICE = (
@@ -81,40 +81,190 @@ TRANSFER_SYNTAXES = [
     JPEGLossless, JPEG2000Lossless, JPEG2000, RLELossless,
 ]
 
+# Status code returned by PACS when patient ID conflicts with existing study
+CONFLICT_STATUS = 0xFFFB
 
-def try_send_c_store(assoc, ds, fpath, decompress_fallback=True, log_fn=None):
-    """Attempt C-STORE. On presentation context rejection, decompress in-memory and retry.
-    Returns (status_value, message, decompressed_flag).
-    status_value: 0x0000=success, 0xFF00/0xFF01=pending, negative=exception, None=no response."""
+
+def resolve_destination_patient(host, port, ae_scu, ae_scp, study_instance_uid, log_fn=None):
+    """C-FIND the destination PACS to discover the PatientID already associated
+    with a given StudyInstanceUID.  Returns a dict with patient demographics
+    {'PatientID': ..., 'PatientName': ..., 'PatientBirthDate': ..., 'PatientSex': ...}
+    or None if the query fails or returns no results."""
+    from pynetdicom.sop_class import StudyRootQueryRetrieveInformationModelFind
+
     try:
-        st = assoc.send_c_store(ds)
-        if st:
-            return (st.Status, "", False)
-        return (None, "No response from SCP", False)
+        ae = AE(ae_title=ae_scu)
+        ae.acse_timeout = 10; ae.dimse_timeout = 15; ae.network_timeout = 10
+        ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
+
+        find_assoc = ae.associate(host, port, ae_title=ae_scp)
+        if not find_assoc.is_established:
+            if log_fn: log_fn("    C-FIND association rejected — cannot resolve patient")
+            return None
+
+        query = pydicom.Dataset()
+        query.QueryRetrieveLevel = 'STUDY'
+        query.StudyInstanceUID = study_instance_uid
+        # Request patient demographics back
+        query.PatientID = ''
+        query.PatientName = ''
+        query.PatientBirthDate = ''
+        query.PatientSex = ''
+
+        result = None
+        responses = find_assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
+        for status, identifier in responses:
+            if status and status.Status in (0xFF00, 0xFF01) and identifier:
+                pid = str(getattr(identifier, 'PatientID', ''))
+                if pid:
+                    result = {
+                        'PatientID': pid,
+                        'PatientName': str(getattr(identifier, 'PatientName', '')),
+                        'PatientBirthDate': str(getattr(identifier, 'PatientBirthDate', '')),
+                        'PatientSex': str(getattr(identifier, 'PatientSex', '')),
+                    }
+                    break  # Only need the first match
+
+        find_assoc.release()
+        return result
     except Exception as e:
-        err_msg = str(e)
-        if 'presentation context' not in err_msg.lower() or not decompress_fallback:
-            return (-1, err_msg, False)
+        if log_fn: log_fn(f"    C-FIND resolve failed: {e}")
+        return None
 
-        # Presentation context rejected — try decompressing to uncompressed transfer syntax
+
+def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
+                     conflict_retry=False, conflict_suffix="_MIG", log_fn=None,
+                     ae=None, host=None, port=None, ae_scp=None, ae_scu=None,
+                     pid_cache=None):
+    """Attempt C-STORE. On presentation context rejection, decompress in-memory and retry.
+    On 0xFFFB patient ID conflict:
+      1. C-FIND the destination to discover the correct PatientID for the study
+      2. Remap the in-memory dataset to match (data lands under existing patient)
+      3. If C-FIND fails, fall back to appending conflict_suffix (creates duplicate)
+    Source files are NEVER modified.
+    pid_cache: optional dict {StudyInstanceUID -> resolved_patient_dict} to avoid
+    repeated C-FIND queries for the same study.
+    Returns (status_value, message, decompressed_flag, conflict_retried_flag, new_assoc_or_None).
+    """
+
+    def _do_send(association, dataset):
+        """Returns (status, message, was_decompressed, new_assoc_or_None)."""
         try:
-            original_tsuid = getattr(ds.file_meta, 'TransferSyntaxUID', None) if hasattr(ds, 'file_meta') else None
-            ts_name = str(original_tsuid.name) if original_tsuid and hasattr(original_tsuid, 'name') else str(original_tsuid or 'Unknown')
+            st = association.send_c_store(dataset)
+            if st:
+                return (st.Status, "", False, None)
+            return (None, "No response from SCP", False, None)
+        except Exception as e:
+            err_msg = str(e)
+            if 'presentation context' not in err_msg.lower() or not decompress_fallback:
+                return (-1, err_msg, False, None)
 
-            ds.decompress()
-
+            # Presentation context rejected — try decompressing to uncompressed transfer syntax
             try:
-                st = assoc.send_c_store(ds)
-                if st:
-                    if log_fn:
-                        log_fn(f"  Decompressed {ts_name} -> Explicit VR LE: {os.path.basename(fpath)}")
-                    return (st.Status, f"Decompressed from {ts_name}", True)
-                return (None, "No response after decompress", True)
-            except Exception as e2:
-                return (-1, f"Failed after decompress: {e2}", True)
-        except Exception as decomp_err:
-            # Decompression not possible (missing codec, etc.)
-            return (-1, f"No context + decompress failed: {decomp_err}", False)
+                # Only attempt decompress on datasets with actual pixel data
+                if not all(hasattr(dataset, attr) for attr in ('Rows', 'Columns', 'BitsAllocated', 'PixelData')):
+                    return (-1, "No presentation context (non-pixel object, decompress N/A)", False, None)
+
+                original_tsuid = getattr(dataset.file_meta, 'TransferSyntaxUID', None) if hasattr(dataset, 'file_meta') else None
+                ts_name = str(original_tsuid.name) if original_tsuid and hasattr(original_tsuid, 'name') else str(original_tsuid or 'Unknown')
+
+                dataset.decompress()
+
+                # Try sending on the existing association first
+                try:
+                    st = association.send_c_store(dataset)
+                    if st:
+                        if log_fn:
+                            log_fn(f"  Decompressed {ts_name} -> Explicit VR LE: {os.path.basename(fpath)}")
+                        return (st.Status, f"Decompressed from {ts_name}", True, None)
+                except Exception:
+                    pass  # Association likely dead after presentation context error — fall through
+
+                # Original association is dead — create a fresh one if we have connection details
+                if ae and host and port and ae_scp:
+                    try:
+                        new_assoc = ae.associate(host, port, ae_title=ae_scp)
+                        if new_assoc.is_established:
+                            st = new_assoc.send_c_store(dataset)
+                            if st:
+                                if log_fn:
+                                    log_fn(f"  Decompressed {ts_name} -> Explicit VR LE (new assoc): {os.path.basename(fpath)}")
+                                return (st.Status, f"Decompressed from {ts_name}", True, new_assoc)
+                            else:
+                                try: new_assoc.release()
+                                except: pass
+                                return (None, "No response after decompress + new assoc", True, None)
+                        else:
+                            return (-1, "Decompress OK but new association rejected", True, None)
+                    except Exception as e3:
+                        return (-1, f"Decompress OK but new assoc failed: {e3}", True, None)
+
+                return (None, "No response after decompress (association dead)", True, None)
+            except Exception as decomp_err:
+                return (-1, f"No context + decompress failed: {decomp_err}", False, None)
+
+    # First attempt — send as-is
+    status_val, msg, was_decompressed, new_assoc = _do_send(assoc, ds)
+
+    # Check for patient ID conflict (0xFFFB) and retry with corrected PatientID
+    if status_val == CONFLICT_STATUS and conflict_retry:
+        original_pid = str(getattr(ds, 'PatientID', 'N/A'))
+        original_name = str(getattr(ds, 'PatientName', 'Unknown'))
+        study_uid = str(getattr(ds, 'StudyInstanceUID', ''))
+
+        resolved = None
+        resolve_method = "suffix"
+
+        # Step 1: Check cache for previously resolved patient
+        if pid_cache is not None and study_uid in pid_cache:
+            resolved = pid_cache[study_uid]
+            resolve_method = "cached C-FIND"
+        # Step 2: C-FIND the destination to find correct PatientID
+        elif host and port and ae_scu and ae_scp and study_uid:
+            if log_fn:
+                log_fn(f"  Patient ID conflict (0xFFFB) for [{original_name}] — querying destination for correct PatientID...")
+            resolved = resolve_destination_patient(host, port, ae_scu, ae_scp, study_uid, log_fn=log_fn)
+            if resolved:
+                resolve_method = "C-FIND"
+                # Cache for subsequent images in the same study
+                if pid_cache is not None:
+                    pid_cache[study_uid] = resolved
+
+        # Step 3: Apply resolved demographics or fall back to suffix
+        if resolved and resolved.get('PatientID'):
+            new_pid = resolved['PatientID']
+            ds.PatientID = new_pid
+            # Also align patient demographics so the PACS doesn't reject on name/DOB/sex mismatch
+            if resolved.get('PatientName'):
+                ds.PatientName = resolved['PatientName']
+            if resolved.get('PatientBirthDate'):
+                ds.PatientBirthDate = resolved['PatientBirthDate']
+            if resolved.get('PatientSex'):
+                ds.PatientSex = resolved['PatientSex']
+
+            if log_fn:
+                log_fn(f"  Remapped via {resolve_method}: PatientID [{original_pid}] -> [{new_pid}] "
+                        f"(destination match)")
+        else:
+            # C-FIND unavailable or returned nothing — fall back to suffix
+            new_pid = f"{original_pid}{conflict_suffix}"
+            ds.PatientID = new_pid
+            if log_fn:
+                log_fn(f"  C-FIND unavailable — suffix fallback: PatientID [{original_pid}] -> [{new_pid}]")
+
+        # Resend with corrected patient demographics
+        send_assoc = new_assoc if new_assoc else assoc
+        retry_status, retry_msg, retry_decomp, retry_new_assoc = _do_send(send_assoc, ds)
+
+        final_new_assoc = retry_new_assoc or new_assoc
+        final_decomp = was_decompressed or retry_decomp
+        conflict_detail = f"Conflict resolved ({resolve_method}): PatientID {original_pid} -> {new_pid}"
+        if retry_msg:
+            conflict_detail += f" ({retry_msg})"
+
+        return (retry_status, conflict_detail, final_decomp, True, final_new_assoc)
+
+    return (status_val, msg, was_decompressed, False, new_assoc)
 
 DARK_STYLE = """
 QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Consolas', monospace; }
@@ -495,16 +645,22 @@ class UploadThread(QThread):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
     speed_update = pyqtSignal(float, float)
+    conflict_retry_count = pyqtSignal(int)  # running total of conflict retries
 
     def __init__(self, files, host, port, ae_scu, ae_scp,
-                 max_pdu=0, batch_size=50, retry_count=1, manifest=None, decompress_fallback=True):
+                 max_pdu=0, batch_size=50, retry_count=1, manifest=None,
+                 decompress_fallback=True, conflict_retry=False, conflict_suffix="_MIG"):
         super().__init__()
         self.files = files; self.host = host; self.port = port
         self.ae_scu = ae_scu; self.ae_scp = ae_scp
         self.max_pdu = max_pdu; self.batch_size = batch_size
         self.retry_count = retry_count; self.manifest = manifest
         self.decompress_fallback = decompress_fallback
+        self.conflict_retry = conflict_retry
+        self.conflict_suffix = conflict_suffix
         self.failure_reasons = defaultdict(int)  # reason -> count
+        self._conflict_retries = 0
+        self._pid_cache = {}  # StudyInstanceUID -> resolved patient dict (C-FIND cache)
         self._cancel = False; self._paused = False
         self._pause_event = threading.Event(); self._pause_event.set()
 
@@ -525,6 +681,8 @@ class UploadThread(QThread):
         start_time = time.time(); bytes_sent = 0
         self.log.emit(f"{'='*60}")
         self.log.emit(f"COPY-ONLY: {DATA_SAFETY_NOTICE}")
+        if self.conflict_retry:
+            self.log.emit(f"Patient ID conflict resolution ENABLED (C-FIND remap, suffix fallback: '{self.conflict_suffix}')")
         self.log.emit(f"{'='*60}")
         self.log.emit(f"Copying {total} files to {self.host}:{self.port}")
 
@@ -550,6 +708,28 @@ class UploadThread(QThread):
                     for f in batch:
                         self._pause_event.wait()
                         if self._cancel: assoc.release(); break
+
+                        # Reconnect if association died (e.g. timeout during pause)
+                        if not assoc.is_established:
+                            self.log.emit("Association lost (timeout during pause?) — reconnecting...")
+                            try: assoc.release()
+                            except: pass
+                            try:
+                                assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp)
+                                if not assoc.is_established:
+                                    self.log.emit("Reconnection failed — aborting batch")
+                                    for remaining in batch[batch.index(f):]:
+                                        failed += 1; file_index += 1; self.progress.emit(file_index, total)
+                                        rsop = remaining.get('sop_instance_uid', '')
+                                        self.file_sent.emit(remaining['path'], False, "Association lost", rsop)
+                                        if self.manifest: self.manifest.record_file(rsop, remaining['path'], 'failed', 'Association lost',
+                                            **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                                    break
+                                self.log.emit("Reconnected successfully")
+                            except Exception as reconn_err:
+                                self.log.emit(f"Reconnection error: {reconn_err}")
+                                break
+
                         file_index += 1
                         fpath = f['path']; sop = f.get('sop_instance_uid', '')
 
@@ -567,18 +747,36 @@ class UploadThread(QThread):
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'skipped', 'Missing SOP UIDs')
                                 self.progress.emit(file_index, total); continue
 
-                            sv, detail, was_decompressed = try_send_c_store(
+                            sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
                                 assoc, ds, fpath, self.decompress_fallback,
-                                log_fn=self.log.emit)
+                                self.conflict_retry, self.conflict_suffix,
+                                log_fn=self.log.emit,
+                                ae=ae, host=self.host, port=self.port,
+                                ae_scp=self.ae_scp, ae_scu=self.ae_scu,
+                                pid_cache=self._pid_cache)
+
+                            # If a fresh association was created (e.g. after decompress),
+                            # switch to it for subsequent sends in this batch
+                            if new_assoc is not None:
+                                try: assoc.release()
+                                except: pass
+                                assoc = new_assoc
+
+                            if was_conflict_retried:
+                                self._conflict_retries += 1
+                                self.conflict_retry_count.emit(self._conflict_retries)
+
                             if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
                                 sent += 1; bytes_sent += f.get('file_size', 0)
-                                msg = ("Decompressed + Copied" if was_decompressed else "Copied") if sv == 0 else f"Pending (0x{sv:04X})"
+                                msg = detail if detail else ("Copied" if sv == 0 else f"Pending (0x{sv:04X})")
+                                if was_decompressed and not detail: msg = "Decompressed + Copied"
                                 self.file_sent.emit(fpath, True, msg, sop)
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
                             elif sv is not None and sv >= 0:
                                 failed += 1; msg = f"Status: 0x{sv:04X}"
+                                if detail: msg += f" ({detail})"
                                 self.file_sent.emit(fpath, False, msg, sop)
-                                self.failure_reasons[msg] += 1
+                                self.failure_reasons[f"Status: 0x{sv:04X}"] += 1
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
                             else:
                                 failed += 1; msg = detail or "No response"
@@ -615,6 +813,8 @@ class UploadThread(QThread):
         self.log.emit(f"\n{'='*60}")
         self.log.emit(f"Migration Complete (COPY-ONLY)")
         self.log.emit(f"  Copied: {sent} | Failed: {failed} | Skipped: {skipped}")
+        if self._conflict_retries:
+            self.log.emit(f"  Patient ID conflicts resolved: {self._conflict_retries}")
         self.log.emit(f"  Time: {elapsed:.1f}s | Source: 0 modified, 0 deleted")
         if self.failure_reasons:
             self.log.emit(f"\nFailure Summary:")
@@ -636,9 +836,12 @@ class StreamingMigrationThread(QThread):
     status = pyqtSignal(str)
     speed_update = pyqtSignal(float, float)
     folder_status = pyqtSignal(str, int, int, int, int)  # folder, dirs_done, sent, failed, skipped
+    conflict_retry_count = pyqtSignal(int)
 
     def __init__(self, root_folder, host, port, ae_scu, ae_scp,
-                 max_pdu=0, batch_size=50, retry_count=1, manifest=None, recursive=True, decompress_fallback=True):
+                 max_pdu=0, batch_size=50, retry_count=1, manifest=None,
+                 recursive=True, decompress_fallback=True,
+                 conflict_retry=False, conflict_suffix="_MIG"):
         super().__init__()
         self.root_folder = root_folder
         self.host = host; self.port = port
@@ -646,7 +849,11 @@ class StreamingMigrationThread(QThread):
         self.max_pdu = max_pdu; self.batch_size = batch_size
         self.retry_count = retry_count; self.manifest = manifest
         self.recursive = recursive; self.decompress_fallback = decompress_fallback
+        self.conflict_retry = conflict_retry
+        self.conflict_suffix = conflict_suffix
         self.failure_reasons = defaultdict(int)
+        self._conflict_retries = 0
+        self._pid_cache = {}  # StudyInstanceUID -> resolved patient dict (C-FIND cache)
         self._cancel = False; self._paused = False
         self._pause_event = threading.Event(); self._pause_event.set()
 
@@ -684,6 +891,27 @@ class StreamingMigrationThread(QThread):
                 for f in batch:
                     self._pause_event.wait()
                     if self._cancel: assoc.release(); return sent, failed, skipped, bytes_sent
+
+                    # Reconnect if association died (e.g. timeout during pause)
+                    if not assoc.is_established:
+                        self.log.emit("Association lost (timeout during pause?) — reconnecting...")
+                        try: assoc.release()
+                        except: pass
+                        try:
+                            assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp)
+                            if not assoc.is_established:
+                                self.log.emit("Reconnection failed — aborting batch")
+                                for remaining in batch[batch.index(f):]:
+                                    failed += 1; rsop = remaining.get('sop_instance_uid', '')
+                                    self.file_sent.emit(remaining['path'], False, "Association lost", rsop)
+                                    if self.manifest: self.manifest.record_file(rsop, remaining['path'], 'failed', 'Association lost',
+                                        **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
+                                return sent, failed, skipped, bytes_sent
+                            self.log.emit("Reconnected successfully")
+                        except Exception as reconn_err:
+                            self.log.emit(f"Reconnection error: {reconn_err}")
+                            return sent, failed, skipped, bytes_sent
+
                     fpath = f['path']; sop = f.get('sop_instance_uid', '')
 
                     # Resume: skip already sent
@@ -699,19 +927,37 @@ class StreamingMigrationThread(QThread):
                             if self.manifest: self.manifest.record_file(sop, fpath, 'skipped', 'Missing SOP UIDs')
                             continue
 
-                        sv, detail, was_decompressed = try_send_c_store(
+                        sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
                             assoc, ds, fpath, self.decompress_fallback,
-                            log_fn=self.log.emit)
+                            self.conflict_retry, self.conflict_suffix,
+                            log_fn=self.log.emit,
+                            ae=ae, host=self.host, port=self.port,
+                            ae_scp=self.ae_scp, ae_scu=self.ae_scu,
+                            pid_cache=self._pid_cache)
+
+                        # If a fresh association was created (e.g. after decompress),
+                        # switch to it for subsequent sends in this batch
+                        if new_assoc is not None:
+                            try: assoc.release()
+                            except: pass
+                            assoc = new_assoc
+
+                        if was_conflict_retried:
+                            self._conflict_retries += 1
+                            self.conflict_retry_count.emit(self._conflict_retries)
+
                         if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
                             sent += 1; bytes_sent += f.get('file_size', 0)
-                            msg = ("Decompressed + Copied" if was_decompressed else "Copied") if sv == 0 else f"Pending (0x{sv:04X})"
+                            msg = detail if detail else ("Copied" if sv == 0 else f"Pending (0x{sv:04X})")
+                            if was_decompressed and not detail: msg = "Decompressed + Copied"
                             self.file_sent.emit(fpath, True, msg, sop)
                             if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg,
                                 **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
                         elif sv is not None and sv >= 0:
                             failed += 1; msg = f"Status: 0x{sv:04X}"
+                            if detail: msg += f" ({detail})"
                             self.file_sent.emit(fpath, False, msg, sop)
-                            self.failure_reasons[msg] += 1
+                            self.failure_reasons[f"Status: 0x{sv:04X}"] += 1
                             if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
                                 **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','modality')})
                         else:
@@ -752,6 +998,8 @@ class StreamingMigrationThread(QThread):
         self.log.emit(f"{'='*60}")
         self.log.emit(f"STREAMING MIGRATION (COPY-ONLY)")
         self.log.emit(f"{DATA_SAFETY_NOTICE}")
+        if self.conflict_retry:
+            self.log.emit(f"Patient ID conflict resolution ENABLED (C-FIND remap, suffix fallback: '{self.conflict_suffix}')")
         self.log.emit(f"{'='*60}")
         self.log.emit(f"Source: {root}")
         self.log.emit(f"Destination: {self.host}:{self.port}")
@@ -823,6 +1071,8 @@ class StreamingMigrationThread(QThread):
         self.log.emit(f"\n{'='*60}")
         self.log.emit(f"Streaming Migration Complete (COPY-ONLY)")
         self.log.emit(f"  Folders: {dirs_done} | Copied: {sent:,} | Failed: {failed:,} | Skipped: {skipped:,}")
+        if self._conflict_retries:
+            self.log.emit(f"  Patient ID conflicts resolved: {self._conflict_retries:,}")
         self.log.emit(f"  Time: {elapsed:.1f}s | Source: 0 modified, 0 deleted")
         if bytes_sent > 0:
             self.log.emit(f"  Data: {bytes_sent/(1024**3):.2f} GB | Avg: {(bytes_sent/(1024**2))/elapsed:.1f} MB/s" if elapsed > 0 else "")
@@ -1045,6 +1295,7 @@ class MainWindow(QMainWindow):
         self.scanner_thread = self.upload_thread = self.verify_thread = self.streaming_thread = None
         self.scan_start_time = self.upload_start_time = None
         self._sent = self._failed = self._skipped = 0
+        self._conflict_retries = 0
         self._upload_results = []  # (path, success, message, sop_uid) for retry
         self._streaming_mode = False
         self._build_ui(); self._load_settings()
@@ -1139,6 +1390,34 @@ class MainWindow(QMainWindow):
         self.decompress_check.setChecked(True)
         self.decompress_check.setToolTip("When a PACS rejects JPEG/JPEG2000/RLE compressed files,\nautomatically decompress to Explicit VR Little Endian in memory and retry.\nSource files are never modified — decompression is in-memory only.")
         al.addWidget(self.decompress_check, 3, 0, 1, 4)
+
+        # Patient ID conflict retry
+        conflict_row = QHBoxLayout()
+        self.conflict_retry_check = QCheckBox("Auto-resolve patient ID conflicts (0xFFFB) via C-FIND + remap")
+        self.conflict_retry_check.setChecked(True)
+        self.conflict_retry_check.setToolTip(
+            "When the destination PACS rejects a study due to patient ID mismatch\n"
+            "(status 0xFFFB), automatically query the destination via C-FIND to\n"
+            "discover the correct PatientID for that study, then remap the incoming\n"
+            "data to match. This puts images under the existing patient record\n"
+            "with zero duplicates.\n\n"
+            "If C-FIND is unavailable, falls back to appending a suffix (creates\n"
+            "a duplicate patient that the PACS admin can merge later).\n\n"
+            "Source files are never modified — all remapping is in-memory only.")
+        conflict_row.addWidget(self.conflict_retry_check)
+        conflict_row.addWidget(QLabel("Fallback suffix:"))
+        self.conflict_suffix_input = QLineEdit("_MIG")
+        self.conflict_suffix_input.setMaxLength(16)
+        self.conflict_suffix_input.setMaximumWidth(120)
+        self.conflict_suffix_input.setToolTip(
+            "Only used when C-FIND cannot resolve the correct PatientID.\n"
+            "Suffix appended to PatientID as a last resort.\n"
+            "Example: PatientID '00023' becomes '00023_MIG'\n"
+            "The PACS admin can then merge the duplicate.")
+        conflict_row.addWidget(self.conflict_suffix_input)
+        conflict_row.addStretch()
+        al.addLayout(conflict_row, 4, 0, 1, 4)
+
         layout.addWidget(ag); layout.addStretch(); return w
 
     # ─── Browser Tab with Filtering ───────────────────────────────────────
@@ -1234,6 +1513,7 @@ class MainWindow(QMainWindow):
         self.sent_label = QLabel("Copied: 0"); self.sent_label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 14px;"); rr.addWidget(self.sent_label)
         self.failed_label = QLabel("Failed: 0"); self.failed_label.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 14px;"); rr.addWidget(self.failed_label)
         self.skipped_label = QLabel("Skipped: 0"); self.skipped_label.setStyleSheet("color: #fab387; font-weight: bold; font-size: 14px;"); rr.addWidget(self.skipped_label)
+        self.conflict_label = QLabel("Conflicts: 0"); self.conflict_label.setStyleSheet("color: #cba6f7; font-weight: bold; font-size: 14px;"); rr.addWidget(self.conflict_label)
         rr.addStretch()
         self.source_safe_lbl = QLabel("Source: 0 modified, 0 deleted"); self.source_safe_lbl.setStyleSheet("color: #94e2d5; font-weight: bold; font-size: 12px;")
         rr.addWidget(self.source_safe_lbl); pl.addLayout(rr); layout.addWidget(pg)
@@ -1527,9 +1807,10 @@ class MainWindow(QMainWindow):
         self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
         self.upload_table.setRowCount(0); self.upload_progress.setValue(0)
         self.upload_progress.setMaximum(len(files_to_send))
-        self._sent = self._failed = self._skipped = 0; self._upload_results = []
+        self._sent = self._failed = self._skipped = self._conflict_retries = 0; self._upload_results = []
         self._streaming_mode = False
-        self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0"); self.skipped_label.setText("Skipped: 0")
+        self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0")
+        self.skipped_label.setText("Skipped: 0"); self.conflict_label.setText("Conflicts: 0")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted")
         self.upload_speed_lbl.setText(""); self.upload_eta_lbl.setText("")
 
@@ -1545,7 +1826,9 @@ class MainWindow(QMainWindow):
             int(self.pdu_combo.currentText().split(" ")[0]),
             self.batch_spin.value(), self.retry_spin.value(),
             manifest=self.manifest,
-            decompress_fallback=self.decompress_check.isChecked())
+            decompress_fallback=self.decompress_check.isChecked(),
+            conflict_retry=self.conflict_retry_check.isChecked(),
+            conflict_suffix=self.conflict_suffix_input.text().strip() or "_MIG")
         self.upload_thread.progress.connect(self._on_upload_progress)
         self.upload_thread.file_sent.connect(self._on_file_sent)
         self.upload_thread.finished.connect(self._on_upload_complete)
@@ -1553,6 +1836,7 @@ class MainWindow(QMainWindow):
         self.upload_thread.log.connect(self._log)
         self.upload_thread.status.connect(self.statusBar().showMessage)
         self.upload_thread.speed_update.connect(self._on_speed)
+        self.upload_thread.conflict_retry_count.connect(self._on_conflict_count)
         self.upload_thread.start()
         self.tabs.setCurrentIndex(2)
         self.stream_folder_lbl.setVisible(False)
@@ -1580,9 +1864,10 @@ class MainWindow(QMainWindow):
         # Reset upload UI
         self.upload_table.setRowCount(0)
         self.upload_progress.setRange(0, 0)  # Indeterminate pulsing bar
-        self._sent = self._failed = self._skipped = 0; self._upload_results = []
+        self._sent = self._failed = self._skipped = self._conflict_retries = 0; self._upload_results = []
         self._streaming_mode = True
-        self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0"); self.skipped_label.setText("Skipped: 0")
+        self.sent_label.setText("Copied: 0"); self.failed_label.setText("Failed: 0")
+        self.skipped_label.setText("Skipped: 0"); self.conflict_label.setText("Conflicts: 0")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted")
         self.upload_speed_lbl.setText(""); self.upload_eta_lbl.setText("")
         self.upload_count_lbl.setText("Streaming...")
@@ -1602,7 +1887,9 @@ class MainWindow(QMainWindow):
             self.batch_spin.value(), self.retry_spin.value(),
             manifest=self.manifest,
             recursive=self.recursive_check.isChecked(),
-            decompress_fallback=self.decompress_check.isChecked())
+            decompress_fallback=self.decompress_check.isChecked(),
+            conflict_retry=self.conflict_retry_check.isChecked(),
+            conflict_suffix=self.conflict_suffix_input.text().strip() or "_MIG")
         self.streaming_thread.file_sent.connect(self._on_file_sent)
         self.streaming_thread.finished.connect(self._on_streaming_complete)
         self.streaming_thread.error.connect(lambda e: self._log(f"ERROR: {e}"))
@@ -1610,8 +1897,13 @@ class MainWindow(QMainWindow):
         self.streaming_thread.status.connect(self.statusBar().showMessage)
         self.streaming_thread.speed_update.connect(self._on_speed)
         self.streaming_thread.folder_status.connect(self._on_folder_status)
+        self.streaming_thread.conflict_retry_count.connect(self._on_conflict_count)
         self.streaming_thread.start()
         self.tabs.setCurrentIndex(2)
+
+    def _on_conflict_count(self, count):
+        self._conflict_retries = count
+        self.conflict_label.setText(f"Conflicts: {count}")
 
     def _on_folder_status(self, folder, dirs_done, sent, failed, skipped):
         self.stream_folder_lbl.setText(f"Folder: {folder}")
@@ -1629,7 +1921,8 @@ class MainWindow(QMainWindow):
         self._streaming_mode = False
         self.stream_folder_lbl.setText("Stream migration complete")
         self.retry_btn.setEnabled(failed > 0)
-        self.statusBar().showMessage(f"Complete - Copied: {sent:,}, Failed: {failed:,}, Skipped: {skipped:,} | Source: UNTOUCHED")
+        conflict_msg = f" | Conflicts resolved: {self._conflict_retries}" if self._conflict_retries else ""
+        self.statusBar().showMessage(f"Complete - Copied: {sent:,}, Failed: {failed:,}, Skipped: {skipped:,}{conflict_msg} | Source: UNTOUCHED")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
         if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
 
@@ -1658,9 +1951,16 @@ class MainWindow(QMainWindow):
                  QTableWidgetItem("OK" if ok else "FAIL"),
                  QTableWidgetItem(msg),
                  QTableWidgetItem(sop_uid[:30] + "..." if len(sop_uid) > 30 else sop_uid)]
-        color = QColor("#a6e3a1") if ok else QColor("#f38ba8")
+        # Color code: green=OK, purple=conflict retry success, red=fail
+        if ok and "Conflict retry" in msg:
+            color = QColor("#cba6f7")  # purple for conflict-retried success
+        elif ok:
+            color = QColor("#a6e3a1")
+        else:
+            color = QColor("#f38ba8")
         items[1].setForeground(color)
         if not ok: items[2].setForeground(color)
+        elif "Conflict retry" in msg: items[2].setForeground(QColor("#cba6f7"))
         for c, it in enumerate(items): self.upload_table.setItem(row, c, it)
         self.upload_table.scrollToBottom()
 
@@ -1678,7 +1978,8 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False); self.cancel_btn.setEnabled(False)
         self.export_csv_btn.setEnabled(True)
         self.retry_btn.setEnabled(failed > 0)
-        self.statusBar().showMessage(f"Complete - Copied: {sent}, Failed: {failed}, Skipped: {skipped} | Source: UNTOUCHED")
+        conflict_msg = f" | Conflicts resolved: {self._conflict_retries}" if self._conflict_retries else ""
+        self.statusBar().showMessage(f"Complete - Copied: {sent}, Failed: {failed}, Skipped: {skipped}{conflict_msg} | Source: UNTOUCHED")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
         if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
 
@@ -1765,6 +2066,8 @@ class MainWindow(QMainWindow):
         s.setValue("retry", self.retry_spin.value()); s.setValue("recursive", self.recursive_check.isChecked())
         s.setValue("manifest_enabled", self.manifest_check.isChecked())
         s.setValue("decompress_fallback", self.decompress_check.isChecked())
+        s.setValue("conflict_retry", self.conflict_retry_check.isChecked())
+        s.setValue("conflict_suffix", self.conflict_suffix_input.text())
 
     def _load_settings(self):
         s = self.settings
@@ -1781,6 +2084,10 @@ class MainWindow(QMainWindow):
         if mc is not None: self.manifest_check.setChecked(mc == "true" or mc is True)
         dc = s.value("decompress_fallback")
         if dc is not None: self.decompress_check.setChecked(dc == "true" or dc is True)
+        cr = s.value("conflict_retry")
+        if cr is not None: self.conflict_retry_check.setChecked(cr == "true" or cr is True)
+        cs = s.value("conflict_suffix")
+        if cs is not None: self.conflict_suffix_input.setText(cs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
