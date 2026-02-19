@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v1.0.1
+DICOM PACS Migrator v1.0.4
 Production-grade DICOM C-STORE migration tool with parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
 morphing, modality/date filtering, TLS encryption, storage commitment verification,
@@ -66,7 +66,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "1.0.1"
+VERSION = "1.0.4"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -90,12 +90,14 @@ TRANSFER_SYNTAXES = [
 
 # Status code returned by PACS when patient ID conflicts with existing study
 CONFLICT_STATUS = 0xFFFB
+CANNOT_UNDERSTAND_RANGE = range(0xC000, 0xD000)
 
 # Errors that should NEVER be retried — permanent/structural failures
 NON_RETRYABLE_PATTERNS = [
     "Invalid DICOM", "Missing SOP",
     "Targeted assoc rejected",    # SCP genuinely doesn't support this SOP class
     "no SOPClassUID",             # Malformed DICOM object
+    "still rejected",             # 0xC000 cleanup attempted and failed — structural issue
 ]
 
 def is_retryable_error(msg):
@@ -401,21 +403,29 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
     Returns (status_value, message, decompressed_flag, conflict_retried_flag, new_assoc_or_None).
     """
 
-    def _build_targeted_ae(sop_class_uid):
-        """Build a minimal AE with just the given SOP class + all transfer syntaxes.
-        This gives the SOP class ALL available presentation context slots,
-        maximizing the chance the destination accepts at least one syntax."""
+    def _build_targeted_ae(sop_class_uid, uncompressed_only=False):
+        """Build a minimal AE with just the given SOP class.
+        For pixel objects: offer all transfer syntaxes (compressed + uncompressed).
+        For non-pixel objects: offer only uncompressed syntaxes — many PACS reject
+        contexts that include JPEG/JPEG2000/RLE for non-pixel SOP classes."""
         targeted = AE(ae_title=ae_scu or "DICOM_MIGRATOR")
         targeted.maximum_pdu_size = 0
         targeted.acse_timeout = 30; targeted.dimse_timeout = 120; targeted.network_timeout = 30
-        targeted.add_requested_context(sop_class_uid, TRANSFER_SYNTAXES)
-        # Also add with just uncompressed syntaxes as separate context
-        targeted.add_requested_context(sop_class_uid, [
-            ExplicitVRLittleEndian, ImplicitVRLittleEndian])
+        if uncompressed_only:
+            # Non-pixel objects: separate contexts for maximum compatibility
+            targeted.add_requested_context(sop_class_uid, [
+                ExplicitVRLittleEndian, ImplicitVRLittleEndian])
+            targeted.add_requested_context(sop_class_uid, [ImplicitVRLittleEndian])
+            targeted.add_requested_context(sop_class_uid, [ExplicitVRLittleEndian])
+            targeted.add_requested_context(sop_class_uid, [DeflatedExplicitVRLittleEndian])
+        else:
+            targeted.add_requested_context(sop_class_uid, TRANSFER_SYNTAXES)
+            targeted.add_requested_context(sop_class_uid, [
+                ExplicitVRLittleEndian, ImplicitVRLittleEndian])
         targeted.add_requested_context(Verification)
         return targeted
 
-    def _try_targeted_assoc(dataset, label="targeted"):
+    def _try_targeted_assoc(dataset, label="targeted", uncompressed_only=False):
         """Last-resort: build a fresh AE with ONLY this SOP class and try a new association."""
         if not (host and port and ae_scp):
             return (-1, f"No context ({label}, no connection info for retry)", False, None)
@@ -423,7 +433,7 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
         if not sop_uid:
             return (-1, f"No context ({label}, no SOPClassUID)", False, None)
         try:
-            targeted_ae = _build_targeted_ae(sop_uid)
+            targeted_ae = _build_targeted_ae(sop_uid, uncompressed_only=uncompressed_only)
             if tls_context:
                 new_assoc = targeted_ae.associate(host, port, ae_title=ae_scp,
                                                    tls_args=(tls_context,))
@@ -436,9 +446,19 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                 sop_name = getattr(dataset, 'SOPClassUID', sop_uid)
                 if hasattr(sop_name, 'name'):
                     sop_name = sop_name.name
-                if log_fn:
-                    log_fn(f"  Sent via targeted assoc ({label}): {os.path.basename(fpath)} [{sop_name}]")
-                return (st.Status, f"Sent via {label} association", False, new_assoc)
+                if st.Status == 0x0000 or st.Status in (0xFF00, 0xFF01):
+                    if log_fn:
+                        log_fn(f"  Sent via targeted assoc ({label}): {os.path.basename(fpath)} [{sop_name}]")
+                    return (st.Status, f"Sent via {label} association", False, new_assoc)
+                else:
+                    # Non-success — extract detail and release
+                    err_detail = _status_detail(st)
+                    detail_msg = f"Targeted {label} 0x{st.Status:04X}"
+                    if err_detail: detail_msg += f" ({err_detail})"
+                    detail_msg += f" [{sop_name}]"
+                    try: new_assoc.release()
+                    except: pass
+                    return (st.Status, detail_msg, False, None)
             else:
                 try: new_assoc.release()
                 except: pass
@@ -446,12 +466,28 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
         except Exception as e:
             return (-1, f"Targeted assoc failed ({label}): {e}", False, None)
 
+    def _status_detail(st_dataset):
+        """Extract human-readable detail from a C-STORE status response."""
+        if st_dataset is None:
+            return ""
+        parts = []
+        # ErrorComment is the primary diagnostic field
+        if hasattr(st_dataset, 'ErrorComment') and st_dataset.ErrorComment:
+            parts.append(str(st_dataset.ErrorComment))
+        # OffendingElement lists which tags caused the failure
+        if hasattr(st_dataset, 'OffendingElement') and st_dataset.OffendingElement:
+            tags = ', '.join(f"({t.group:04X},{t.elem:04X})" if hasattr(t, 'group')
+                            else str(t) for t in st_dataset.OffendingElement)
+            parts.append(f"Offending: {tags}")
+        return '; '.join(parts)
+
     def _do_send(association, dataset):
         """Returns (status, message, was_decompressed, new_assoc_or_None)."""
         try:
             st = association.send_c_store(dataset)
             if st:
-                return (st.Status, "", False, None)
+                detail = _status_detail(st)
+                return (st.Status, detail, False, None)
             return (None, "No response from SCP", False, None)
         except Exception as e:
             err_msg = str(e)
@@ -460,7 +496,8 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
 
             if not decompress_fallback:
                 # Still try a targeted association even without decompress
-                return _try_targeted_assoc(dataset, "no-decompress")
+                has_px = all(hasattr(dataset, a) for a in ('PixelData', 'Rows', 'Columns', 'BitsAllocated'))
+                return _try_targeted_assoc(dataset, "no-decompress", uncompressed_only=not has_px)
 
             # ── Step 1: Try decompressing pixel data objects ──
             has_pixels = all(hasattr(dataset, attr) for attr in ('PixelData',))
@@ -478,9 +515,12 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                     try:
                         st = association.send_c_store(dataset)
                         if st:
-                            if log_fn:
+                            detail_info = _status_detail(st)
+                            decomp_msg = f"Decompressed from {ts_name}"
+                            if detail_info: decomp_msg += f" ({detail_info})"
+                            if log_fn and (st.Status == 0x0000 or st.Status in (0xFF00, 0xFF01)):
                                 log_fn(f"  Decompressed {ts_name} -> Explicit VR LE: {os.path.basename(fpath)}")
-                            return (st.Status, f"Decompressed from {ts_name}", True, None)
+                            return (st.Status, decomp_msg, True, None)
                     except Exception:
                         pass  # Association likely dead — fall through
 
@@ -516,7 +556,10 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                         log_fn(f"  Decompress failed: {decomp_err}, trying targeted assoc...")
 
             # ── Step 3: Non-pixel object OR decompress failed — targeted association ──
-            return _try_targeted_assoc(dataset, "non-pixel" if not has_pixel_attrs else "decompress-failed")
+            is_non_pixel = not has_pixel_attrs
+            return _try_targeted_assoc(dataset,
+                "non-pixel" if is_non_pixel else "decompress-failed",
+                uncompressed_only=is_non_pixel)
 
     # First attempt — send as-is
     status_val, msg, was_decompressed, new_assoc = _do_send(assoc, ds)
@@ -578,6 +621,113 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
             conflict_detail += f" ({retry_msg})"
 
         return (retry_status, conflict_detail, final_decomp, True, final_new_assoc)
+
+    # ── 0xC000-0xCFFF: "Cannot Understand" — multi-step recovery ──
+    # Step 1: Strip private tags + fix metadata → send on existing association
+    # Step 2: Decompress pixel data (if present) → send on existing association
+    # Step 3: Cleaned + decompressed → targeted uncompressed-only association
+    if status_val is not None and status_val in CANNOT_UNDERSTAND_RANGE:
+        import copy as _copy
+        sop_uid_obj = getattr(ds, 'SOPClassUID', '?')
+        sop_name = sop_uid_obj.name if hasattr(sop_uid_obj, 'name') else str(sop_uid_obj)
+        sop_uid = str(sop_uid_obj)
+        pid = str(getattr(ds, 'PatientID', '?'))
+        study = str(getattr(ds, 'StudyDescription', ''))[:40] or str(getattr(ds, 'StudyInstanceUID', '?'))[-12:]
+        n_private = sum(1 for elem in ds if elem.tag.is_private)
+        original_ts = None
+        if hasattr(ds, 'file_meta'):
+            original_ts = getattr(ds.file_meta, 'TransferSyntaxUID', None)
+        ts_name = str(original_ts.name) if original_ts and hasattr(original_ts, 'name') else str(original_ts or 'Unknown')
+
+        if log_fn:
+            log_fn(f"  0x{status_val:04X} '{sop_name}' PID={pid} Study={study} "
+                   f"TS={ts_name} ({n_private} private tags) — starting recovery...")
+        try:
+            clean = _copy.deepcopy(ds)
+            # ── Cleanup: strip private tags, fix metadata, remove empty sequences ──
+            clean.remove_private_tags()
+            if hasattr(clean, 'file_meta') and hasattr(clean, 'SOPClassUID'):
+                clean.file_meta.MediaStorageSOPClassUID = clean.SOPClassUID
+                clean.file_meta.MediaStorageSOPInstanceUID = clean.SOPInstanceUID
+            if not hasattr(clean, 'SpecificCharacterSet') or not clean.SpecificCharacterSet:
+                clean.SpecificCharacterSet = 'ISO_IR 100'
+            empty_sq_tags = [elem.tag for elem in clean
+                             if elem.VR == 'SQ' and elem.value is not None and len(elem.value) == 0]
+            for tag in empty_sq_tags:
+                del clean[tag]
+
+            # ── Step 1: Clean dataset on existing association ──
+            send_assoc = new_assoc if new_assoc else assoc
+            sv1, msg1, decomp1, new1 = _do_send(send_assoc, clean)
+            if sv1 is not None and sv1 >= 0 and (sv1 == 0x0000 or sv1 in (0xFF00, 0xFF01)):
+                if log_fn: log_fn(f"  Step 1 OK (stripped {n_private} private tags): {os.path.basename(fpath)}")
+                return (sv1, f"Cleaned (stripped {n_private} private tags)", was_decompressed or decomp1, False, new1 or new_assoc)
+
+            # ── Step 2: Decompress pixel data + clean on existing association ──
+            has_pixels = all(hasattr(clean, a) for a in ('PixelData', 'Rows', 'Columns', 'BitsAllocated'))
+            decomp_ok = False
+            if has_pixels:
+                try:
+                    clean.decompress()
+                    decomp_ok = True
+                    if log_fn: log_fn(f"  Step 2: decompressed {ts_name} -> Explicit VR LE, retrying...")
+                    send2 = new1 if new1 and new1.is_established else (new_assoc if new_assoc else assoc)
+                    sv2, msg2, _, new2 = _do_send(send2, clean)
+                    if sv2 is not None and sv2 >= 0 and (sv2 == 0x0000 or sv2 in (0xFF00, 0xFF01)):
+                        if log_fn: log_fn(f"  Step 2 OK (cleaned + decompressed): {os.path.basename(fpath)}")
+                        final = new2 or new1 or new_assoc
+                        return (sv2, f"Cleaned + decompressed from {ts_name}", True, False, final)
+                    if new2:
+                        try: new2.release()
+                        except: pass
+                except Exception as decomp_err:
+                    if log_fn: log_fn(f"  Step 2: decompress failed ({decomp_err}), trying targeted...")
+
+            # ── Step 3: Targeted uncompressed-only association ──
+            if host and port and ae_scp:
+                try:
+                    is_non_pixel = not has_pixels
+                    targeted_ae = _build_targeted_ae(sop_uid, uncompressed_only=True)
+                    if tls_context:
+                        t_assoc = targeted_ae.associate(host, port, ae_title=ae_scp, tls_args=(tls_context,))
+                    else:
+                        t_assoc = targeted_ae.associate(host, port, ae_title=ae_scp)
+                    if t_assoc.is_established:
+                        if log_fn: log_fn(f"  Step 3: targeted uncompressed association for {sop_name}...")
+                        st3 = t_assoc.send_c_store(clean)
+                        if st3 and (st3.Status == 0x0000 or st3.Status in (0xFF00, 0xFF01)):
+                            if log_fn: log_fn(f"  Step 3 OK (targeted uncompressed): {os.path.basename(fpath)}")
+                            detail = f"Cleaned + targeted uncompressed"
+                            if decomp_ok: detail = f"Cleaned + decompressed + targeted uncompressed"
+                            return (st3.Status, detail, decomp_ok or was_decompressed, False, t_assoc)
+                        # Still rejected on targeted — get detail
+                        t_detail = _status_detail(st3) if st3 else ""
+                        t_status = f"0x{st3.Status:04X}" if st3 else "no response"
+                        if log_fn: log_fn(f"  Step 3 rejected: {t_status} {t_detail}")
+                        try: t_assoc.release()
+                        except: pass
+                    else:
+                        if log_fn: log_fn(f"  Step 3: targeted association rejected for {sop_uid}")
+                except Exception as t_err:
+                    if log_fn: log_fn(f"  Step 3 failed: {t_err}")
+
+            # ── All steps exhausted ──
+            detail_parts = [f"0x{status_val:04X} Cannot Understand"]
+            if msg: detail_parts.append(msg)
+            detail_parts.append(f"{sop_name}, PID={pid}, TS={ts_name}")
+            steps_tried = ["private tags stripped"]
+            if decomp_ok: steps_tried.append("decompressed")
+            steps_tried.append("targeted uncompressed")
+            detail_parts.append(f"tried: {', '.join(steps_tried)} — still rejected")
+            if new1:
+                try: new1.release()
+                except: pass
+            return (status_val, '; '.join(detail_parts), was_decompressed, False, new_assoc)
+        except Exception as clean_err:
+            if log_fn:
+                log_fn(f"  0xC000 recovery failed: {clean_err}")
+            detail = f"0x{status_val:04X} Cannot Understand ({sop_name}, PID={pid}, recovery failed: {clean_err})"
+            return (status_val, detail, was_decompressed, False, new_assoc)
 
     return (status_val, msg, was_decompressed, False, new_assoc)
 
@@ -985,9 +1135,10 @@ class ScannerThread(QThread):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, folder_path, recursive=True):
+    def __init__(self, folder_path, recursive=True, manifest=None):
         super().__init__()
         self.folder_path = folder_path; self.recursive = recursive; self._cancel = False
+        self.manifest = manifest
 
     def cancel(self): self._cancel = True
 
@@ -997,6 +1148,30 @@ class ScannerThread(QThread):
             self.log.emit(f"Scanning (READ-ONLY): {self.folder_path}")
             self.status.emit("Enumerating files...")
             root = Path(self.folder_path)
+
+            # Build path-based cache from manifest for instant metadata lookup
+            _manifest_cache = {}  # path -> record dict
+            if self.manifest and self.manifest.records:
+                for uid, rec in self.manifest.records.items():
+                    p = rec.get('path', '')
+                    if p and rec.get('status') in ('sent', 'skipped'):
+                        _manifest_cache[p] = {
+                            'path': p,
+                            'patient_name': rec.get('patient_name', 'Unknown'),
+                            'patient_id': rec.get('patient_id', 'N/A'),
+                            'study_date': rec.get('study_date', ''),
+                            'study_desc': rec.get('study_desc', ''),
+                            'series_desc': '',
+                            'modality': rec.get('modality', 'OT'),
+                            'sop_class_uid': rec.get('sop_class_uid', ''),
+                            'sop_instance_uid': uid,
+                            'study_instance_uid': rec.get('study_instance_uid', ''),
+                            'series_instance_uid': rec.get('series_instance_uid', ''),
+                            'transfer_syntax': str(ImplicitVRLittleEndian),
+                            'file_size': 0,
+                        }
+                if _manifest_cache:
+                    self.log.emit(f"Manifest cache: {len(_manifest_cache):,} files with cached metadata (instant scan)")
 
             # Use os.walk instead of glob — yields incrementally on large stores
             all_files = []
@@ -1014,7 +1189,7 @@ class ScannerThread(QThread):
 
             total = len(all_files)
             self.log.emit(f"Found {total:,} files in {dir_count:,} folders, reading DICOM headers...")
-            dc = sk = 0
+            dc = sk = cached = 0
             for i, fpath in enumerate(all_files):
                 if self._cancel: self.finished.emit(results); return
                 self.progress.emit(i + 1, total)
@@ -1023,9 +1198,24 @@ class ScannerThread(QThread):
                     rel = fpath.relative_to(root)
                 except ValueError:
                     rel = fpath.name
+
+                # Fast path: use cached metadata from manifest instead of reading DICOM header
+                fpath_str = str(fpath)
+                if fpath_str in _manifest_cache:
+                    rec = _manifest_cache[fpath_str]
+                    # Get actual file size (cheap stat vs expensive dcmread)
+                    try: rec['file_size'] = fpath.stat().st_size
+                    except: pass
+                    results.append(rec)
+                    dc += 1; cached += 1
+                    if (i + 1) % 5000 == 0:
+                        self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM ({cached:,} cached) | {sk:,} skipped")
+                        self.current_file.emit(f"Fast-cached: {rel}", dc, sk)
+                    continue
+
                 self.current_file.emit(str(rel), dc, sk)
                 if (i + 1) % 100 == 0:
-                    self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM | {sk:,} skipped")
+                    self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM ({cached:,} cached) | {sk:,} skipped")
                 try:
                     ds = pydicom.dcmread(str(fpath), stop_before_pixels=True, force=True)
                     if not hasattr(ds, 'SOPClassUID'): sk += 1; continue
@@ -1047,7 +1237,8 @@ class ScannerThread(QThread):
                     dc += 1
                     if dc % 1000 == 0: self.log.emit(f"  {dc:,} DICOM files parsed...")
                 except: sk += 1
-            self.log.emit(f"Scan complete: {dc:,} DICOM, {sk:,} skipped (all read-only)")
+            cache_msg = f" ({cached:,} from manifest cache)" if cached else ""
+            self.log.emit(f"Scan complete: {dc:,} DICOM{cache_msg}, {sk:,} skipped (all read-only)")
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(f"Scan failed: {e}\n{traceback.format_exc()}")
@@ -1276,6 +1467,34 @@ class UploadThread(QThread):
                     self.log.emit(f"Remaining: {total:,} files to send")
 
         self.log.emit(f"Copying {total} files to {self.host}:{self.port}")
+
+        # ── Manifest Resume: filter out already-sent files upfront ──
+        # Instead of checking each file inside the worker loop (120K queue ops),
+        # remove them from the list now so workers only see unsent files.
+        manifest_skipped = 0
+        if self.manifest and self.manifest.records:
+            before = len(self.files)
+            sent_sops = set(uid for uid, rec in self.manifest.records.items()
+                            if rec.get('status') == 'sent')
+            if sent_sops:
+                self.files = [f for f in self.files
+                              if f.get('sop_instance_uid', '') not in sent_sops]
+                manifest_skipped = before - len(self.files)
+                if manifest_skipped > 0:
+                    total = len(self.files)
+                    skipped += manifest_skipped
+                    self.log.emit(f"Resume: {manifest_skipped:,} files already sent (skipped instantly)")
+                    self.log.emit(f"Remaining: {total:,} files to send")
+                    # Also count failed files for retry info
+                    failed_count = sum(1 for r in self.manifest.records.values()
+                                       if r.get('status') == 'failed')
+                    if failed_count:
+                        self.log.emit(f"  ({failed_count:,} previously failed files will be retried)")
+
+        if total == 0:
+            self.log.emit("All files already sent. Nothing to do.")
+            self.finished.emit(0, 0, skipped)
+            return
 
         if self.workers > 1:
             sent, failed, skipped_w, bytes_sent = self._run_parallel(total, start_time)
@@ -3200,7 +3419,7 @@ class MainWindow(QMainWindow):
         else:
             self.resume_label.setText("Manifest disabled — no files written to source folder")
 
-        self.scanner_thread = ScannerThread(folder, self.recursive_check.isChecked())
+        self.scanner_thread = ScannerThread(folder, self.recursive_check.isChecked(), manifest=self.manifest)
         self.scanner_thread.progress.connect(self._on_scan_progress)
         self.scanner_thread.current_file.connect(self._on_scan_file)
         self.scanner_thread.log.connect(self._log)
