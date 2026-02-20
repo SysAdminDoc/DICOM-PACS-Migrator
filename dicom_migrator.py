@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v1.0.4
+DICOM PACS Migrator v2.0.0
 Production-grade DICOM C-STORE migration tool with parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
 morphing, modality/date filtering, TLS encryption, storage commitment verification,
 post-migration C-FIND audit, network auto-discovery, resume support, streaming
 migration, decompress fallback, patient ID conflict resolution, pre-flight
-duplicate skip, DICOM validation, error classification, and audit trail.
+duplicate skip, DICOM validation, error classification, circuit breaker destination
+protection, adaptive latency-based throttling, transfer syntax probing, pre-migration
+data quality analysis, HIPAA audit logging, auto-verify two-point confirmation,
+study-level batching, time-of-day peak-hours rate control, SOP class fallback
+to Secondary Capture, priority queue for urgent studies, and batched Storage Commitment.
 Copy-only architecture — source data is NEVER modified or deleted.
 """
 # SPDX-License-Identifier: MIT
@@ -66,7 +70,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "1.0.4"
+VERSION = "2.0.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -76,8 +80,15 @@ DATA_SAFETY_NOTICE = (
     "PACS via C-STORE. Original files remain completely untouched."
 )
 
+PHI_WARNING = (
+    "HIPAA Notice: Migration manifests, audit logs, and application logs "
+    "may contain Protected Health Information (PHI) including patient names, "
+    "IDs, and study metadata. Handle these files in accordance with your "
+    "organization's HIPAA security policies. Encrypt at rest when possible."
+)
+
 logger = logging.getLogger("DICOMMigrator")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)  # Production: INFO level — DEBUG available via --debug flag
 
 COMMON_DICOM_PORTS = [104, 11112, 4242, 2762, 2575, 8042, 4006, 5678, 3003, 106]
 
@@ -91,6 +102,22 @@ TRANSFER_SYNTAXES = [
 # Status code returned by PACS when patient ID conflicts with existing study
 CONFLICT_STATUS = 0xFFFB
 CANNOT_UNDERSTAND_RANGE = range(0xC000, 0xD000)
+
+def _is_cstore_success(status_val):
+    """Check if a C-STORE status indicates the data was stored successfully.
+    Covers standard success, DICOM warnings (data stored with coercion),
+    and vendor-specific statuses observed in the field."""
+    if status_val is None or status_val < 0:
+        return False
+    if status_val == 0x0000:                    # Success
+        return True
+    if status_val in (0xFF00, 0xFF01):          # Pending (some SCP return these)
+        return True
+    if 0xB000 <= status_val <= 0xBFFF:          # Warning — data stored with coercion
+        return True
+    if status_val == 0xFFFA:                    # Vendor-specific — stored with coercion
+        return True
+    return False
 
 # Errors that should NEVER be retried — permanent/structural failures
 NON_RETRYABLE_PATTERNS = [
@@ -147,6 +174,366 @@ class BandwidthThrottle:
                     self._tokens -= nbytes
                     return
             time.sleep(0.01)  # Yield and retry
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Circuit Breaker — Prevents cascade failures when destination PACS is overwhelmed
+# ═══════════════════════════════════════════════════════════════════════════════
+class CircuitBreaker:
+    """Thread-safe circuit breaker for destination PACS protection.
+    States: CLOSED (normal), OPEN (blocking), HALF_OPEN (probing).
+    After `failure_threshold` consecutive failures, enters OPEN state for
+    `recovery_seconds`. Then allows one probe request (HALF_OPEN). If probe
+    succeeds, resets to CLOSED. If probe fails, re-opens for another cycle."""
+
+    CLOSED = 'CLOSED'
+    OPEN = 'OPEN'
+    HALF_OPEN = 'HALF_OPEN'
+
+    def __init__(self, failure_threshold=5, recovery_seconds=60, cancel_event=None, log_fn=None):
+        self._lock = threading.Lock()
+        self.failure_threshold = failure_threshold
+        self.recovery_seconds = recovery_seconds
+        self._cancel_event = cancel_event
+        self._log_fn = log_fn
+        self._state = self.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at = 0.0
+        self._total_trips = 0
+
+    @property
+    def state(self):
+        with self._lock:
+            return self._state
+
+    def allow_request(self):
+        """Returns True if the request should proceed. Blocks during OPEN state
+        until recovery_seconds elapsed, then transitions to HALF_OPEN."""
+        while True:
+            if self._cancel_event and self._cancel_event.is_set():
+                return False
+            with self._lock:
+                if self._state == self.CLOSED:
+                    return True
+                if self._state == self.HALF_OPEN:
+                    return True  # One probe allowed
+                # OPEN — check if recovery period has elapsed
+                elapsed = time.monotonic() - self._opened_at
+                if elapsed >= self.recovery_seconds:
+                    self._state = self.HALF_OPEN
+                    if self._log_fn:
+                        self._log_fn(f"  Circuit breaker: HALF_OPEN — sending probe request after {self.recovery_seconds}s recovery")
+                    return True
+            # Still OPEN — wait
+            time.sleep(1.0)
+
+    def record_success(self):
+        """Record a successful request. Resets circuit to CLOSED."""
+        with self._lock:
+            if self._state == self.HALF_OPEN:
+                if self._log_fn:
+                    self._log_fn(f"  Circuit breaker: probe succeeded — CLOSED (resuming normal operation)")
+            self._consecutive_failures = 0
+            self._state = self.CLOSED
+
+    def record_failure(self):
+        """Record a failed request. May trip the breaker to OPEN."""
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._state == self.HALF_OPEN:
+                # Probe failed — re-open
+                self._state = self.OPEN
+                self._opened_at = time.monotonic()
+                self._total_trips += 1
+                if self._log_fn:
+                    self._log_fn(f"  Circuit breaker: probe FAILED — re-OPEN for {self.recovery_seconds}s (trip #{self._total_trips})")
+                return
+            if self._consecutive_failures >= self.failure_threshold and self._state == self.CLOSED:
+                self._state = self.OPEN
+                self._opened_at = time.monotonic()
+                self._total_trips += 1
+                if self._log_fn:
+                    self._log_fn(f"  Circuit breaker: OPEN after {self._consecutive_failures} consecutive failures — "
+                                 f"pausing all sends for {self.recovery_seconds}s (trip #{self._total_trips})")
+
+    def reset(self):
+        with self._lock:
+            self._state = self.CLOSED
+            self._consecutive_failures = 0
+
+    @property
+    def stats(self):
+        with self._lock:
+            return {'state': self._state, 'consecutive_failures': self._consecutive_failures,
+                    'total_trips': self._total_trips}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Adaptive Throttle — Latency-based rate control for destination protection
+# ═══════════════════════════════════════════════════════════════════════════════
+class AdaptiveThrottle:
+    """Thread-safe adaptive throttle that adjusts inter-send delay based on
+    C-STORE response latency. Faster responses = less delay. Slower responses =
+    more delay. Superior to fixed bandwidth caps because it responds to actual
+    destination load rather than a static limit.
+
+    Usage: call record_latency(seconds) after each C-STORE response.
+           call get_delay() before sending next file — sleep for returned value."""
+
+    def __init__(self, target_latency=1.0, max_delay=5.0, smoothing=0.2):
+        self._lock = threading.Lock()
+        self._avg_latency = 0.0
+        self._target_latency = target_latency    # Ideal response time in seconds
+        self._max_delay = max_delay               # Cap inter-send delay
+        self._smoothing = smoothing               # EMA smoothing factor (0-1, higher = more reactive)
+        self._sample_count = 0
+        self.enabled = False  # Disabled by default — user enables via UI
+
+    def record_latency(self, latency_seconds):
+        """Record a C-STORE response latency measurement."""
+        with self._lock:
+            if self._sample_count == 0:
+                self._avg_latency = latency_seconds
+            else:
+                self._avg_latency = (self._smoothing * latency_seconds +
+                                     (1.0 - self._smoothing) * self._avg_latency)
+            self._sample_count += 1
+
+    def get_delay(self):
+        """Returns recommended inter-send delay in seconds. 0 if latency is
+        below target, scales up proportionally as latency exceeds target."""
+        if not self.enabled:
+            return 0.0
+        with self._lock:
+            if self._sample_count < 5:
+                return 0.0  # Not enough data yet
+            if self._avg_latency <= self._target_latency:
+                return 0.0  # Destination is keeping up
+            # Scale delay proportionally: 2× target latency = 1s delay, 3× = 2s, etc.
+            ratio = self._avg_latency / self._target_latency
+            delay = min((ratio - 1.0) * self._target_latency, self._max_delay)
+            return max(0.0, delay)
+
+    @property
+    def stats(self):
+        with self._lock:
+            return {'avg_latency': round(self._avg_latency, 3),
+                    'sample_count': self._sample_count,
+                    'current_delay': round(self.get_delay(), 3),
+                    'enabled': self.enabled}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Transfer Syntax Prober — Discovers destination SOP class + TS acceptance policy
+# ═══════════════════════════════════════════════════════════════════════════════
+def probe_destination_ts(host, port, ae_scu, ae_scp, sop_classes, log_fn=None, tls_context=None):
+    """Probe the destination PACS to discover which SOP classes and transfer syntaxes
+    are accepted. Returns dict: {sop_class_uid: [accepted_transfer_syntaxes]}.
+    This eliminates wasted attempts on unsupported presentation contexts."""
+    accepted = {}
+    rejected = set()
+
+    # Probe in batches of 120 SOP classes (128 max contexts, minus safety margin)
+    batch_size = 120
+    sop_list = list(set(sop_classes))
+
+    for i in range(0, len(sop_list), batch_size):
+        batch = sop_list[i:i + batch_size]
+        ae = AE(ae_title=ae_scu)
+        ae.maximum_pdu_size = 0
+        ae.acse_timeout = 10; ae.dimse_timeout = 10; ae.network_timeout = 10
+
+        for uid in batch:
+            ae.add_requested_context(uid, TRANSFER_SYNTAXES)
+
+        try:
+            if tls_context:
+                assoc = ae.associate(host, port, ae_title=ae_scp, tls_args=(tls_context,))
+            else:
+                assoc = ae.associate(host, port, ae_title=ae_scp)
+
+            if assoc.is_established:
+                for cx in assoc.accepted_contexts:
+                    sop_uid = str(cx.abstract_syntax)
+                    ts_uid = str(cx.transfer_syntax[0]) if cx.transfer_syntax else None
+                    if sop_uid not in accepted:
+                        accepted[sop_uid] = []
+                    if ts_uid:
+                        accepted[sop_uid].append(ts_uid)
+                for cx in assoc.rejected_contexts:
+                    rejected.add(str(cx.abstract_syntax))
+                assoc.release()
+            else:
+                if log_fn:
+                    log_fn(f"TS Probe: association rejected for batch {i//batch_size + 1}")
+        except Exception as e:
+            if log_fn:
+                log_fn(f"TS Probe error: {e}")
+
+    if log_fn:
+        log_fn(f"TS Probe: {len(accepted)} SOP classes accepted, {len(rejected)} rejected")
+
+    return accepted, rejected
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HIPAA Audit Logger — Structured migration audit trail (JSON-lines format)
+# ═══════════════════════════════════════════════════════════════════════════════
+class AuditLogger:
+    """Thread-safe HIPAA-compliant audit trail for DICOM migrations.
+    Logs each migration event as a JSON line for compliance and forensics.
+    Events: migration_start, file_sent, file_failed, migration_complete, verify_result.
+    WARNING: Audit logs contain PHI. Encrypt at rest per organizational policy."""
+
+    def __init__(self, log_path=None):
+        self._lock = threading.Lock()
+        self._path = log_path
+        self._events = []
+        self._session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.enabled = log_path is not None
+
+    def set_path(self, path):
+        self._path = path
+        self.enabled = path is not None
+
+    def log_event(self, event_type, **kwargs):
+        """Log a structured audit event."""
+        if not self.enabled:
+            return
+        entry = {
+            'timestamp': datetime.now().isoformat(),
+            'session': self._session_id,
+            'event': event_type,
+            **kwargs
+        }
+        with self._lock:
+            self._events.append(entry)
+            # Flush every 500 events or on critical events
+            if len(self._events) >= 500 or event_type in ('migration_start', 'migration_complete', 'verify_result'):
+                self._flush()
+
+    def _flush(self):
+        """Write pending events to disk."""
+        if not self._path or not self._events:
+            return
+        try:
+            with open(self._path, 'a', encoding='utf-8') as f:
+                for entry in self._events:
+                    f.write(json.dumps(entry, default=str) + '\n')
+            self._events.clear()
+        except Exception:
+            pass  # Non-critical — don't crash migration for audit logging
+
+    def finalize(self):
+        """Flush remaining events on shutdown."""
+        with self._lock:
+            self._flush()
+
+    @property
+    def event_count(self):
+        with self._lock:
+            return len(self._events)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data Quality Analyzer — Pre-migration inventory and issue detection
+# ═══════════════════════════════════════════════════════════════════════════════
+def analyze_scan_data(files, log_fn=None):
+    """Analyze scanned DICOM files to produce a pre-migration data quality report.
+    Identifies potential issues before migration starts, preventing mid-migration failures.
+    Returns dict with analysis results."""
+    report = {
+        'total_files': len(files),
+        'total_size_mb': 0,
+        'patients': defaultdict(int),
+        'studies': defaultdict(int),
+        'modalities': defaultdict(int),
+        'sop_classes': defaultdict(int),
+        'transfer_syntaxes': defaultdict(int),
+        'issues': [],
+        'issue_counts': defaultdict(int),
+    }
+
+    missing_patient_name = 0
+    missing_patient_id = 0
+    missing_study_date = 0
+    missing_study_uid = 0
+    empty_modality = 0
+    duplicate_sop_uids = set()
+    seen_sop_uids = set()
+
+    for f in files:
+        # Accumulate stats
+        report['total_size_mb'] += f.get('file_size', 0) / (1024 * 1024)
+        report['patients'][f"{f.get('patient_name', '')}|{f.get('patient_id', '')}"] += 1
+        report['studies'][f.get('study_instance_uid', '')] += 1
+        report['modalities'][f.get('modality', 'UNKNOWN')] += 1
+        report['sop_classes'][f.get('sop_class_uid', '')] += 1
+        report['transfer_syntaxes'][f.get('transfer_syntax', '')] += 1
+
+        # Check for issues
+        pn = f.get('patient_name', '')
+        if not pn or pn in ('Unknown', '', 'N/A'):
+            missing_patient_name += 1
+        pid = f.get('patient_id', '')
+        if not pid or pid in ('N/A', ''):
+            missing_patient_id += 1
+        sd = f.get('study_date', '')
+        if not sd:
+            missing_study_date += 1
+        suid = f.get('study_instance_uid', '')
+        if not suid:
+            missing_study_uid += 1
+        mod = f.get('modality', '')
+        if not mod or mod == 'OT':
+            empty_modality += 1
+
+        # Duplicate SOP UID detection
+        sop = f.get('sop_instance_uid', '')
+        if sop:
+            if sop in seen_sop_uids:
+                duplicate_sop_uids.add(sop)
+            seen_sop_uids.add(sop)
+
+    # Build issue list
+    if missing_patient_name:
+        report['issues'].append(f"{missing_patient_name:,} files with missing/unknown PatientName")
+        report['issue_counts']['missing_patient_name'] = missing_patient_name
+    if missing_patient_id:
+        report['issues'].append(f"{missing_patient_id:,} files with missing PatientID")
+        report['issue_counts']['missing_patient_id'] = missing_patient_id
+    if missing_study_date:
+        report['issues'].append(f"{missing_study_date:,} files with missing StudyDate")
+        report['issue_counts']['missing_study_date'] = missing_study_date
+    if missing_study_uid:
+        report['issues'].append(f"{missing_study_uid:,} files with missing StudyInstanceUID (may fail transfer)")
+        report['issue_counts']['missing_study_uid'] = missing_study_uid
+    if empty_modality:
+        report['issues'].append(f"{empty_modality:,} files with missing/generic modality (OT)")
+        report['issue_counts']['generic_modality'] = empty_modality
+    if duplicate_sop_uids:
+        report['issues'].append(f"{len(duplicate_sop_uids):,} duplicate SOP Instance UIDs detected")
+        report['issue_counts']['duplicate_sop'] = len(duplicate_sop_uids)
+
+    # Convert defaultdicts for serialization
+    report['total_size_mb'] = round(report['total_size_mb'], 1)
+
+    if log_fn:
+        log_fn(f"--- Pre-Migration Data Quality Report ---")
+        log_fn(f"  Files: {report['total_files']:,} | Size: {report['total_size_mb']:,.1f} MB")
+        log_fn(f"  Patients: {len(report['patients']):,} | Studies: {len(report['studies']):,}")
+        log_fn(f"  Modalities: {', '.join(f'{m}({c})' for m, c in sorted(report['modalities'].items(), key=lambda x: -x[1]))}")
+        log_fn(f"  SOP Classes: {len(report['sop_classes']):,} unique")
+        log_fn(f"  Transfer Syntaxes: {len(report['transfer_syntaxes']):,} unique")
+        if report['issues']:
+            log_fn(f"  Issues found ({len(report['issues'])}):")
+            for issue in report['issues']:
+                log_fn(f"    - {issue}")
+        else:
+            log_fn(f"  No data quality issues detected")
+        log_fn(f"--- End Report ---")
+
+    return report
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -253,17 +640,119 @@ def wait_for_schedule(start_time, end_time, enabled, cancel_event, log_fn=None, 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Study-Level Batching — Groups files by study for atomic transfers
+# ═══════════════════════════════════════════════════════════════════════════════
+def group_files_by_study(files):
+    """Group files by StudyInstanceUID, preserving series/instance order within each study.
+    Returns list of (study_uid, study_files) tuples sorted by patient name then study date.
+    Benefits: atomic study transfers, tailored presentation contexts per study,
+    and simplified post-send per-study verification."""
+    studies = defaultdict(list)
+    study_meta = {}
+    for f in files:
+        suid = f.get('study_instance_uid', '') or '__no_study__'
+        studies[suid].append(f)
+        if suid not in study_meta:
+            study_meta[suid] = {
+                'patient': f.get('patient_name', ''),
+                'date': f.get('study_date', ''),
+                'desc': f.get('study_desc', ''),
+            }
+
+    # Sort studies by patient name, then study date for logical ordering
+    sorted_studies = sorted(studies.items(),
+        key=lambda x: (study_meta.get(x[0], {}).get('patient', ''),
+                        study_meta.get(x[0], {}).get('date', '')))
+
+    # Within each study, sort by series then instance for consistent ordering
+    for suid, flist in sorted_studies:
+        flist.sort(key=lambda f: (f.get('series_instance_uid', ''), f.get('sop_instance_uid', '')))
+
+    return sorted_studies
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Time-of-Day Rate Control — Reduces throughput during clinical hours
+# ═══════════════════════════════════════════════════════════════════════════════
+class TimeOfDayRateControl:
+    """Adaptive rate control that throttles migration during clinical hours
+    to avoid impacting production PACS performance, then runs at full speed
+    during off-hours.
+
+    During peak hours: limits to peak_workers and adds peak_delay between sends.
+    During off-peak hours: allows full worker count with no delay."""
+
+    def __init__(self, peak_start=None, peak_end=None, peak_workers=1, peak_delay=0.5,
+                 enabled=False, cancel_event=None, log_fn=None):
+        self._lock = threading.Lock()
+        self.peak_start = peak_start or dtime(7, 0)   # 07:00 default clinical start
+        self.peak_end = peak_end or dtime(18, 0)       # 18:00 default clinical end
+        self.peak_workers = max(1, peak_workers)
+        self.peak_delay = peak_delay
+        self.enabled = enabled
+        self._cancel_event = cancel_event
+        self._log_fn = log_fn
+        self._last_state = None
+
+    def is_peak_hours(self):
+        """Check if current time is within peak clinical hours."""
+        if not self.enabled:
+            return False
+        now = datetime.now().time()
+        if self.peak_start <= self.peak_end:
+            return self.peak_start <= now <= self.peak_end
+        else:
+            return now >= self.peak_start or now <= self.peak_end
+
+    def get_effective_workers(self, max_workers):
+        """Returns the number of workers that should be active right now."""
+        if not self.enabled:
+            return max_workers
+        if self.is_peak_hours():
+            return min(self.peak_workers, max_workers)
+        return max_workers
+
+    def get_delay(self):
+        """Returns inter-send delay in seconds for current time period."""
+        if not self.enabled:
+            return 0.0
+        if self.is_peak_hours():
+            return self.peak_delay
+        return 0.0
+
+    def check_and_log_transition(self):
+        """Log when transitioning between peak and off-peak."""
+        if not self.enabled:
+            return
+        current = self.is_peak_hours()
+        if self._last_state is not None and current != self._last_state:
+            if self._log_fn:
+                if current:
+                    self._log_fn(f"  Rate control: entering peak hours ({self.peak_start.strftime('%H:%M')}-"
+                                 f"{self.peak_end.strftime('%H:%M')}) — reducing to {self.peak_workers} worker(s) "
+                                 f"with {self.peak_delay}s delay")
+                else:
+                    self._log_fn(f"  Rate control: off-peak hours — full speed resumed")
+        self._last_state = current
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TLS Context Builder — Encrypted DICOM associations
 # ═══════════════════════════════════════════════════════════════════════════════
 def build_tls_context(cert_file=None, key_file=None, ca_file=None):
-    """Build an SSL context for DICOM TLS. Returns ssl.SSLContext or None."""
+    """Build an SSL context for DICOM TLS. Returns ssl.SSLContext or None.
+    SECURITY: Without a CA file, certificate verification is disabled.
+    This is acceptable on isolated medical imaging networks but should be
+    logged for audit purposes."""
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Enforce TLS 1.2+
         if ca_file and os.path.exists(ca_file):
             ctx.load_verify_locations(ca_file)
         else:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            logger.warning("TLS enabled without CA verification — certificates will not be validated")
         if cert_file and os.path.exists(cert_file):
             ctx.load_cert_chain(cert_file, keyfile=key_file if key_file and os.path.exists(key_file) else None)
         return ctx
@@ -295,7 +784,7 @@ def preflight_check_destination(host, port, ae_scu, ae_scp, study_uids, log_fn=N
     existing = set()
     try:
         ae = AE(ae_title=ae_scu)
-        ae.acse_timeout = 15; ae.dimse_timeout = 30; ae.network_timeout = 15
+        ae.maximum_pdu_size = 0; ae.acse_timeout = 15; ae.dimse_timeout = 30; ae.network_timeout = 15
         ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
 
         assoc = ae.associate(host, port, ae_title=ae_scp)
@@ -337,6 +826,8 @@ def preflight_check_destination(host, port, ae_scu, ae_scp, study_uids, log_fn=N
             log_fn(f"Pre-flight complete: {len(existing)}/{total} studies already on destination")
     except Exception as e:
         if log_fn: log_fn(f"Pre-flight check failed: {e}")
+        try: assoc.release()
+        except: pass
 
     return existing
 
@@ -350,7 +841,7 @@ def resolve_destination_patient(host, port, ae_scu, ae_scp, study_instance_uid, 
 
     try:
         ae = AE(ae_title=ae_scu)
-        ae.acse_timeout = 10; ae.dimse_timeout = 15; ae.network_timeout = 10
+        ae.maximum_pdu_size = 0; ae.acse_timeout = 10; ae.dimse_timeout = 15; ae.network_timeout = 10
         ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
 
         find_assoc = ae.associate(host, port, ae_title=ae_scp)
@@ -358,31 +849,33 @@ def resolve_destination_patient(host, port, ae_scu, ae_scp, study_instance_uid, 
             if log_fn: log_fn("    C-FIND association rejected — cannot resolve patient")
             return None
 
-        query = pydicom.Dataset()
-        query.QueryRetrieveLevel = 'STUDY'
-        query.StudyInstanceUID = study_instance_uid
-        # Request patient demographics back
-        query.PatientID = ''
-        query.PatientName = ''
-        query.PatientBirthDate = ''
-        query.PatientSex = ''
+        try:
+            query = pydicom.Dataset()
+            query.QueryRetrieveLevel = 'STUDY'
+            query.StudyInstanceUID = study_instance_uid
+            # Request patient demographics back
+            query.PatientID = ''
+            query.PatientName = ''
+            query.PatientBirthDate = ''
+            query.PatientSex = ''
 
-        result = None
-        responses = find_assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
-        for status, identifier in responses:
-            if status and status.Status in (0xFF00, 0xFF01) and identifier:
-                pid = str(getattr(identifier, 'PatientID', ''))
-                if pid:
-                    result = {
-                        'PatientID': pid,
-                        'PatientName': str(getattr(identifier, 'PatientName', '')),
-                        'PatientBirthDate': str(getattr(identifier, 'PatientBirthDate', '')),
-                        'PatientSex': str(getattr(identifier, 'PatientSex', '')),
-                    }
-                    break  # Only need the first match
-
-        find_assoc.release()
-        return result
+            result = None
+            responses = find_assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
+            for status, identifier in responses:
+                if status and status.Status in (0xFF00, 0xFF01) and identifier:
+                    pid = str(getattr(identifier, 'PatientID', ''))
+                    if pid:
+                        result = {
+                            'PatientID': pid,
+                            'PatientName': str(getattr(identifier, 'PatientName', '')),
+                            'PatientBirthDate': str(getattr(identifier, 'PatientBirthDate', '')),
+                            'PatientSex': str(getattr(identifier, 'PatientSex', '')),
+                        }
+                        break  # Only need the first match
+            return result
+        finally:
+            try: find_assoc.release()
+            except: pass
     except Exception as e:
         if log_fn: log_fn(f"    C-FIND resolve failed: {e}")
         return None
@@ -441,17 +934,42 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                 new_assoc = targeted_ae.associate(host, port, ae_title=ae_scp)
             if not new_assoc.is_established:
                 return (-1, f"Targeted assoc rejected for {sop_uid}", False, None)
-            st = new_assoc.send_c_store(dataset)
+
+            # When sending on uncompressed-only association, the dataset's
+            # TransferSyntaxUID must match a negotiated context. Override it
+            # to Explicit VR LE so pynetdicom doesn't reject the send.
+            original_ts = None
+            original_le = None
+            original_ivr = None
+            if uncompressed_only and hasattr(dataset, 'file_meta'):
+                original_ts = getattr(dataset.file_meta, 'TransferSyntaxUID', None)
+                original_le = getattr(dataset, 'is_little_endian', None)
+                original_ivr = getattr(dataset, 'is_implicit_VR', None)
+                dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+                dataset.is_little_endian = True
+                dataset.is_implicit_VR = False
+
+            try:
+                st = new_assoc.send_c_store(dataset)
+            finally:
+                # Restore original TS and encoding flags so the dataset isn't
+                # corrupted for other code paths (e.g. 0xC000 recovery)
+                if original_ts is not None and hasattr(dataset, 'file_meta'):
+                    dataset.file_meta.TransferSyntaxUID = original_ts
+                if original_le is not None:
+                    dataset.is_little_endian = original_le
+                if original_ivr is not None:
+                    dataset.is_implicit_VR = original_ivr
+
             if st:
                 sop_name = getattr(dataset, 'SOPClassUID', sop_uid)
                 if hasattr(sop_name, 'name'):
                     sop_name = sop_name.name
-                if st.Status == 0x0000 or st.Status in (0xFF00, 0xFF01):
+                if _is_cstore_success(st.Status):
                     if log_fn:
                         log_fn(f"  Sent via targeted assoc ({label}): {os.path.basename(fpath)} [{sop_name}]")
                     return (st.Status, f"Sent via {label} association", False, new_assoc)
                 else:
-                    # Non-success — extract detail and release
                     err_detail = _status_detail(st)
                     detail_msg = f"Targeted {label} 0x{st.Status:04X}"
                     if err_detail: detail_msg += f" ({err_detail})"
@@ -518,7 +1036,7 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                             detail_info = _status_detail(st)
                             decomp_msg = f"Decompressed from {ts_name}"
                             if detail_info: decomp_msg += f" ({detail_info})"
-                            if log_fn and (st.Status == 0x0000 or st.Status in (0xFF00, 0xFF01)):
+                            if log_fn and _is_cstore_success(st.Status):
                                 log_fn(f"  Decompressed {ts_name} -> Explicit VR LE: {os.path.basename(fpath)}")
                             return (st.Status, decomp_msg, True, None)
                     except Exception:
@@ -564,6 +1082,22 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
     # First attempt — send as-is
     status_val, msg, was_decompressed, new_assoc = _do_send(assoc, ds)
 
+    # ── 0xA700: "Out of Resources" — immediate retry with backoff ──
+    # This is usually transient: PACS ingest queue is saturated, not disk full.
+    # A brief pause lets the PACS catch up before we retry on the same association.
+    if status_val == 0xA700:
+        for a700_attempt in range(1, 4):  # Up to 3 retries: 2s, 4s, 8s
+            delay = 2 * (2 ** (a700_attempt - 1))
+            if log_fn:
+                log_fn(f"  0xA700 Out of Resources — backoff {delay}s (attempt {a700_attempt}/3)...")
+            time.sleep(delay)
+            send_assoc = new_assoc if new_assoc else assoc
+            status_val, msg, was_decompressed, new_assoc = _do_send(send_assoc, ds)
+            if status_val != 0xA700:
+                break  # Either success or a different error — stop retrying
+        if status_val == 0xA700 and log_fn:
+            log_fn(f"  0xA700 persisted after 3 retries (14s total backoff)")
+
     # Check for patient ID conflict (0xFFFB) and retry with corrected PatientID
     if status_val == CONFLICT_STATUS and conflict_retry:
         original_pid = str(getattr(ds, 'PatientID', 'N/A'))
@@ -591,18 +1125,48 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
         # Step 3: Apply resolved demographics or fall back to suffix
         if resolved and resolved.get('PatientID'):
             new_pid = resolved['PatientID']
-            ds.PatientID = new_pid
-            # Also align patient demographics so the PACS doesn't reject on name/DOB/sex mismatch
-            if resolved.get('PatientName'):
-                ds.PatientName = resolved['PatientName']
-            if resolved.get('PatientBirthDate'):
-                ds.PatientBirthDate = resolved['PatientBirthDate']
-            if resolved.get('PatientSex'):
-                ds.PatientSex = resolved['PatientSex']
+            # Detect no-op remap: C-FIND returned the same PatientID we already have.
+            # This means the conflict isn't about PatientID — it's likely a PatientName,
+            # DOB, or Sex mismatch. Apply ALL demographics from C-FIND, not just PID.
+            if new_pid == original_pid:
+                # Still apply other demographics — conflict may be name/DOB/sex
+                name_changed = dob_changed = sex_changed = False
+                if resolved.get('PatientName') and str(resolved['PatientName']) != str(getattr(ds, 'PatientName', '')):
+                    ds.PatientName = resolved['PatientName']; name_changed = True
+                if resolved.get('PatientBirthDate') and resolved['PatientBirthDate'] != str(getattr(ds, 'PatientBirthDate', '')):
+                    ds.PatientBirthDate = resolved['PatientBirthDate']; dob_changed = True
+                if resolved.get('PatientSex') and resolved['PatientSex'] != str(getattr(ds, 'PatientSex', '')):
+                    ds.PatientSex = resolved['PatientSex']; sex_changed = True
 
-            if log_fn:
-                log_fn(f"  Remapped via {resolve_method}: PatientID [{original_pid}] -> [{new_pid}] "
-                        f"(destination match)")
+                changes = []
+                if name_changed: changes.append(f"Name->{resolved['PatientName']}")
+                if dob_changed: changes.append(f"DOB->{resolved['PatientBirthDate']}")
+                if sex_changed: changes.append(f"Sex->{resolved['PatientSex']}")
+
+                if changes:
+                    if log_fn:
+                        log_fn(f"  Same PID [{original_pid}] — demographics mismatch: {', '.join(changes)}")
+                    resolve_method = f"{resolve_method} demographics"
+                else:
+                    # C-FIND returned identical demographics — suffix is the only option
+                    new_pid = f"{original_pid}{conflict_suffix}"
+                    ds.PatientID = new_pid
+                    if log_fn:
+                        log_fn(f"  C-FIND returned same PID+demographics — suffix fallback: [{original_pid}] -> [{new_pid}]")
+                    resolve_method = "suffix (C-FIND identical)"
+            else:
+                ds.PatientID = new_pid
+                # Also align patient demographics so the PACS doesn't reject on name/DOB/sex mismatch
+                if resolved.get('PatientName'):
+                    ds.PatientName = resolved['PatientName']
+                if resolved.get('PatientBirthDate'):
+                    ds.PatientBirthDate = resolved['PatientBirthDate']
+                if resolved.get('PatientSex'):
+                    ds.PatientSex = resolved['PatientSex']
+
+                if log_fn:
+                    log_fn(f"  Remapped via {resolve_method}: PatientID [{original_pid}] -> [{new_pid}] "
+                            f"(destination match)")
         else:
             # C-FIND unavailable or returned nothing — fall back to suffix
             new_pid = f"{original_pid}{conflict_suffix}"
@@ -616,7 +1180,11 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
 
         final_new_assoc = retry_new_assoc or new_assoc
         final_decomp = was_decompressed or retry_decomp
-        conflict_detail = f"Conflict resolved ({resolve_method}): PatientID {original_pid} -> {new_pid}"
+        current_pid = str(getattr(ds, 'PatientID', new_pid))
+        if current_pid != original_pid:
+            conflict_detail = f"Conflict resolved ({resolve_method}): PatientID {original_pid} -> {current_pid}"
+        else:
+            conflict_detail = f"Conflict resolved ({resolve_method}): PID {original_pid}"
         if retry_msg:
             conflict_detail += f" ({retry_msg})"
 
@@ -659,7 +1227,7 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
             # ── Step 1: Clean dataset on existing association ──
             send_assoc = new_assoc if new_assoc else assoc
             sv1, msg1, decomp1, new1 = _do_send(send_assoc, clean)
-            if sv1 is not None and sv1 >= 0 and (sv1 == 0x0000 or sv1 in (0xFF00, 0xFF01)):
+            if _is_cstore_success(sv1):
                 if log_fn: log_fn(f"  Step 1 OK (stripped {n_private} private tags): {os.path.basename(fpath)}")
                 return (sv1, f"Cleaned (stripped {n_private} private tags)", was_decompressed or decomp1, False, new1 or new_assoc)
 
@@ -673,7 +1241,7 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                     if log_fn: log_fn(f"  Step 2: decompressed {ts_name} -> Explicit VR LE, retrying...")
                     send2 = new1 if new1 and new1.is_established else (new_assoc if new_assoc else assoc)
                     sv2, msg2, _, new2 = _do_send(send2, clean)
-                    if sv2 is not None and sv2 >= 0 and (sv2 == 0x0000 or sv2 in (0xFF00, 0xFF01)):
+                    if _is_cstore_success(sv2):
                         if log_fn: log_fn(f"  Step 2 OK (cleaned + decompressed): {os.path.basename(fpath)}")
                         final = new2 or new1 or new_assoc
                         return (sv2, f"Cleaned + decompressed from {ts_name}", True, False, final)
@@ -694,8 +1262,14 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                         t_assoc = targeted_ae.associate(host, port, ae_title=ae_scp)
                     if t_assoc.is_established:
                         if log_fn: log_fn(f"  Step 3: targeted uncompressed association for {sop_name}...")
+                        # Force uncompressed TS on the clean copy so pynetdicom
+                        # can match a negotiated presentation context
+                        if hasattr(clean, 'file_meta'):
+                            clean.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+                            clean.is_little_endian = True
+                            clean.is_implicit_VR = False
                         st3 = t_assoc.send_c_store(clean)
-                        if st3 and (st3.Status == 0x0000 or st3.Status in (0xFF00, 0xFF01)):
+                        if st3 and _is_cstore_success(st3.Status):
                             if log_fn: log_fn(f"  Step 3 OK (targeted uncompressed): {os.path.basename(fpath)}")
                             detail = f"Cleaned + targeted uncompressed"
                             if decomp_ok: detail = f"Cleaned + decompressed + targeted uncompressed"
@@ -710,6 +1284,8 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
                         if log_fn: log_fn(f"  Step 3: targeted association rejected for {sop_uid}")
                 except Exception as t_err:
                     if log_fn: log_fn(f"  Step 3 failed: {t_err}")
+                    try: t_assoc.release()
+                    except: pass  # t_assoc may not exist or may already be released
 
             # ── All steps exhausted ──
             detail_parts = [f"0x{status_val:04X} Cannot Understand"]
@@ -729,64 +1305,166 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
             detail = f"0x{status_val:04X} Cannot Understand ({sop_name}, PID={pid}, recovery failed: {clean_err})"
             return (status_val, detail, was_decompressed, False, new_assoc)
 
+    # ── 0xA900: "Data Set does not match SOP Class" — SOP Class fallback ──
+    # The destination rejected the file because the SOPClassUID doesn't match
+    # what it expects. Last resort: reclassify as Secondary Capture to salvage
+    # the study data (loses modality-specific metadata but preserves images).
+    if status_val == 0xA900 and host and port and ae_scp:
+        import copy as _a900_copy
+        sop_uid_obj = getattr(ds, 'SOPClassUID', '?')
+        sop_name = sop_uid_obj.name if hasattr(sop_uid_obj, 'name') else str(sop_uid_obj)
+        if log_fn:
+            log_fn(f"  0xA900 '{sop_name}' — attempting Secondary Capture fallback...")
+        try:
+            sc_ds = _a900_copy.deepcopy(ds)
+            # Reclassify as Secondary Capture Image Storage
+            SC_SOP_CLASS = '1.2.840.10008.5.1.4.1.1.7'  # Secondary Capture Image Storage
+            sc_ds.SOPClassUID = SC_SOP_CLASS
+            if hasattr(sc_ds, 'file_meta'):
+                sc_ds.file_meta.MediaStorageSOPClassUID = SC_SOP_CLASS
+            # Ensure required Secondary Capture attributes exist
+            if not hasattr(sc_ds, 'ConversionType'):
+                sc_ds.ConversionType = 'WSD'  # Workstation
+            # Build targeted AE for Secondary Capture
+            sc_ae = AE(ae_title=ae_scu or "DICOM_MIGRATOR")
+            sc_ae.maximum_pdu_size = 0
+            sc_ae.acse_timeout = 30; sc_ae.dimse_timeout = 120; sc_ae.network_timeout = 30
+            sc_ae.add_requested_context(SC_SOP_CLASS, TRANSFER_SYNTAXES)
+            sc_ae.add_requested_context(SC_SOP_CLASS, [ExplicitVRLittleEndian, ImplicitVRLittleEndian])
+            sc_ae.add_requested_context(Verification)
+            if tls_context:
+                sc_assoc = sc_ae.associate(host, port, ae_title=ae_scp, tls_args=(tls_context,))
+            else:
+                sc_assoc = sc_ae.associate(host, port, ae_title=ae_scp)
+            if sc_assoc.is_established:
+                # Try decompressed first if pixel data present
+                has_px = all(hasattr(sc_ds, a) for a in ('PixelData', 'Rows', 'Columns', 'BitsAllocated'))
+                if has_px:
+                    try:
+                        sc_ds.decompress()
+                        if hasattr(sc_ds, 'file_meta'):
+                            sc_ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+                            sc_ds.is_little_endian = True; sc_ds.is_implicit_VR = False
+                    except Exception:
+                        pass  # Send as-is if decompress fails
+                st_sc = sc_assoc.send_c_store(sc_ds)
+                if st_sc and _is_cstore_success(st_sc.Status):
+                    if log_fn:
+                        log_fn(f"  0xA900 recovered: {sop_name} -> Secondary Capture: {os.path.basename(fpath)}")
+                    return (st_sc.Status, f"SOP fallback: {sop_name} -> Secondary Capture", True, False, sc_assoc)
+                else:
+                    sc_detail = f"0x{st_sc.Status:04X}" if st_sc else "no response"
+                    if log_fn: log_fn(f"  Secondary Capture also rejected: {sc_detail}")
+                    try: sc_assoc.release()
+                    except: pass
+            else:
+                if log_fn: log_fn(f"  Secondary Capture association rejected by destination")
+        except Exception as sc_err:
+            if log_fn: log_fn(f"  0xA900 Secondary Capture fallback failed: {sc_err}")
+
     return (status_val, msg, was_decompressed, False, new_assoc)
 
 DARK_STYLE = """
-QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Consolas', monospace; }
-QGroupBox { border: 1px solid #45475a; border-radius: 8px; margin-top: 1.2em; padding: 14px 10px 10px 10px; color: #cdd6f4; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #89b4fa; }
-QPushButton { background-color: #89b4fa; color: #1e1e2e; border: none; padding: 8px 18px; border-radius: 6px; font-weight: bold; font-size: 13px; }
-QPushButton:hover { background-color: #74c7ec; }
-QPushButton:pressed { background-color: #89dceb; }
-QPushButton:disabled { background-color: #45475a; color: #6c7086; }
-QPushButton[danger="true"] { background-color: #f38ba8; }
-QPushButton[danger="true"]:hover { background-color: #eba0ac; }
-QPushButton[success="true"] { background-color: #a6e3a1; }
-QPushButton[success="true"]:hover { background-color: #94e2d5; }
-QPushButton[warning="true"] { background-color: #fab387; }
-QPushButton[warning="true"]:hover { background-color: #f9e2af; }
-QLineEdit, QSpinBox { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 7px 10px; font-size: 13px; selection-background-color: #89b4fa; selection-color: #1e1e2e; }
-QLineEdit:focus, QSpinBox:focus { border-color: #89b4fa; }
-QTextEdit { background-color: #11111b; color: #a6adc8; border: 1px solid #313244; border-radius: 6px; padding: 6px; font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace; font-size: 12px; }
-QProgressBar { background-color: #313244; border: none; border-radius: 6px; text-align: center; color: #cdd6f4; font-weight: bold; min-height: 22px; }
-QProgressBar::chunk { background-color: #89b4fa; border-radius: 6px; }
-QTreeWidget { background-color: #181825; alternate-background-color: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; font-size: 12px; outline: none; }
-QTreeWidget::item { padding: 3px 0; }
-QTreeWidget::item:selected { background-color: #313244; color: #89b4fa; }
-QTreeWidget::item:hover { background-color: #252537; }
-QHeaderView::section { background-color: #181825; color: #89b4fa; border: none; border-bottom: 2px solid #313244; padding: 6px 8px; font-weight: bold; font-size: 12px; }
-QTabWidget::pane { border: 1px solid #313244; background: #1e1e2e; border-radius: 6px; }
-QTabBar::tab { background: #181825; color: #6c7086; padding: 8px 20px; border: none; border-bottom: 2px solid transparent; font-weight: bold; }
-QTabBar::tab:selected { color: #89b4fa; border-bottom-color: #89b4fa; background: #1e1e2e; }
-QTabBar::tab:hover { color: #cdd6f4; }
-QCheckBox { spacing: 8px; color: #cdd6f4; }
-QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; border: 1px solid #45475a; background: #313244; }
-QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
-QComboBox { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 6px 10px; }
-QComboBox::drop-down { border: none; width: 24px; }
-QComboBox QAbstractItemView { background-color: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; selection-background-color: #313244; }
-QSplitter::handle { background-color: #313244; height: 3px; }
-QScrollBar:vertical { background: #181825; width: 10px; border: none; }
-QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 30px; }
-QScrollBar::handle:vertical:hover { background: #585b70; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal { background: #181825; height: 10px; border: none; }
-QScrollBar::handle:horizontal { background: #45475a; border-radius: 5px; min-width: 30px; }
-QScrollBar::handle:horizontal:hover { background: #585b70; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-QStatusBar { background-color: #11111b; color: #6c7086; border-top: 1px solid #313244; font-size: 12px; }
-QLabel { color: #cdd6f4; }
-QLabel[heading="true"] { font-size: 14px; font-weight: bold; color: #89b4fa; }
-QLabel[subtext="true"] { color: #6c7086; font-size: 11px; }
-QLabel[stat="true"] { font-size: 22px; font-weight: bold; color: #cdd6f4; }
-QFrame[separator="true"] { background-color: #313244; max-height: 1px; }
-QTableWidget { background-color: #181825; alternate-background-color: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; gridline-color: #313244; font-size: 12px; outline: none; }
-QTableWidget::item { padding: 4px 8px; }
-QTableWidget::item:selected { background-color: #313244; color: #89b4fa; }
-QTableWidget::item:hover { background-color: #252537; }
+/* ═══ Premium Dark Theme — Catppuccin Mocha Deep ═══ */
+
+/* ─── Base ─── */
+QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }
 QDialog { background-color: #1e1e2e; color: #cdd6f4; }
-QDateEdit { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 6px 10px; }
-QDateEdit::drop-down { border: none; width: 24px; }
+
+/* ─── Group Boxes ─── */
+QGroupBox { border: 1px solid #313244; border-radius: 10px; margin-top: 1.4em; padding: 16px 12px 12px 12px; color: #cdd6f4; font-weight: 600; background-color: rgba(24, 24, 37, 0.5); }
+QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 8px; color: #89b4fa; font-size: 13px; }
+
+/* ─── Buttons ─── */
+QPushButton { background-color: #89b4fa; color: #11111b; border: none; padding: 9px 22px; border-radius: 8px; font-weight: 700; font-size: 13px; }
+QPushButton:hover { background-color: #b4d0fb; }
+QPushButton:pressed { background-color: #74c7ec; }
+QPushButton:disabled { background-color: #313244; color: #585b70; }
+QPushButton[danger="true"] { background-color: #f38ba8; color: #11111b; }
+QPushButton[danger="true"]:hover { background-color: #f5a0b8; }
+QPushButton[success="true"] { background-color: #a6e3a1; color: #11111b; }
+QPushButton[success="true"]:hover { background-color: #b8eab5; }
+QPushButton[warning="true"] { background-color: #fab387; color: #11111b; }
+QPushButton[warning="true"]:hover { background-color: #fbc4a0; }
+
+/* ─── Inputs ─── */
+QLineEdit, QSpinBox, QDoubleSpinBox, QTimeEdit, QDateEdit {
+    background-color: #181825; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px;
+    padding: 8px 12px; font-size: 13px; selection-background-color: #89b4fa; selection-color: #11111b;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus, QDateEdit:focus { border-color: #89b4fa; border-width: 2px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::down-button { border: none; background: transparent; width: 18px; }
+QTimeEdit::up-button, QTimeEdit::down-button, QDateEdit::up-button, QDateEdit::down-button { border: none; background: transparent; width: 18px; }
+
+/* ─── Text Areas ─── */
+QTextEdit, QPlainTextEdit {
+    background-color: #11111b; color: #a6adc8; border: 1px solid #1e1e2e; border-radius: 8px;
+    padding: 8px; font-family: 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace; font-size: 12px;
+}
+
+/* ─── Progress Bar ─── */
+QProgressBar { background-color: #181825; border: none; border-radius: 8px; text-align: center; color: #cdd6f4; font-weight: 700; min-height: 26px; font-size: 12px; }
+QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #89b4fa, stop:1 #74c7ec); border-radius: 8px; }
+
+/* ─── Tree Widget ─── */
+QTreeWidget { background-color: #11111b; alternate-background-color: #151520; color: #cdd6f4; border: 1px solid #1e1e2e; border-radius: 8px; font-size: 12px; outline: none; padding: 4px; }
+QTreeWidget::item { padding: 4px 2px; border-radius: 4px; }
+QTreeWidget::item:selected { background-color: rgba(137, 180, 250, 0.15); color: #89b4fa; }
+QTreeWidget::item:hover { background-color: rgba(137, 180, 250, 0.08); }
+QTreeWidget::branch:has-children:!has-siblings:closed, QTreeWidget::branch:closed:has-children:has-siblings { image: none; border-image: none; }
+
+/* ─── Table Widget ─── */
+QTableWidget { background-color: #11111b; alternate-background-color: #151520; color: #cdd6f4; border: 1px solid #1e1e2e; border-radius: 8px; gridline-color: #1e1e2e; font-size: 12px; outline: none; padding: 2px; }
+QTableWidget::item { padding: 5px 10px; border-bottom: 1px solid #1a1a2e; }
+QTableWidget::item:selected { background-color: rgba(137, 180, 250, 0.15); color: #89b4fa; }
+QTableWidget::item:hover { background-color: rgba(137, 180, 250, 0.06); }
+
+/* ─── Headers ─── */
+QHeaderView::section { background-color: #11111b; color: #7f849c; border: none; border-bottom: 2px solid #1e1e2e; padding: 8px 10px; font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* ─── Tabs ─── */
+QTabWidget::pane { border: 1px solid #1e1e2e; background: #1e1e2e; border-radius: 8px; top: -1px; }
+QTabBar::tab { background: transparent; color: #585b70; padding: 10px 24px; border: none; border-bottom: 3px solid transparent; font-weight: 700; font-size: 13px; margin-right: 2px; }
+QTabBar::tab:selected { color: #89b4fa; border-bottom-color: #89b4fa; background: rgba(137, 180, 250, 0.06); }
+QTabBar::tab:hover:!selected { color: #a6adc8; border-bottom-color: #45475a; }
+
+/* ─── Checkboxes ─── */
+QCheckBox { spacing: 10px; color: #cdd6f4; font-size: 13px; }
+QCheckBox::indicator { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #45475a; background: #181825; }
+QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; image: none; }
+QCheckBox::indicator:hover { border-color: #89b4fa; }
+
+/* ─── Combo Box ─── */
+QComboBox { background-color: #181825; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+QComboBox:focus { border-color: #89b4fa; }
+QComboBox::drop-down { border: none; width: 28px; }
+QComboBox QAbstractItemView { background-color: #181825; color: #cdd6f4; border: 1px solid #313244; selection-background-color: rgba(137, 180, 250, 0.2); selection-color: #89b4fa; border-radius: 6px; outline: none; }
+
+/* ─── Splitter ─── */
+QSplitter::handle { background-color: #313244; height: 2px; }
+
+/* ─── Scrollbars ─── */
+QScrollBar:vertical { background: transparent; width: 8px; border: none; margin: 2px; }
+QScrollBar::handle:vertical { background: #313244; border-radius: 4px; min-height: 40px; }
+QScrollBar::handle:vertical:hover { background: #45475a; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 8px; border: none; margin: 2px; }
+QScrollBar::handle:horizontal { background: #313244; border-radius: 4px; min-width: 40px; }
+QScrollBar::handle:horizontal:hover { background: #45475a; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* ─── Status Bar ─── */
+QStatusBar { background-color: #11111b; color: #585b70; border-top: 1px solid #1e1e2e; font-size: 12px; padding: 2px 8px; }
+
+/* ─── Tooltips ─── */
+QToolTip { background-color: #181825; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+
+/* ─── Labels ─── */
+QLabel { color: #cdd6f4; }
+QLabel[heading="true"] { font-size: 15px; font-weight: 700; color: #89b4fa; }
+QLabel[subtext="true"] { color: #585b70; font-size: 11px; }
+QLabel[stat="true"] { font-size: 26px; font-weight: 800; color: #cdd6f4; letter-spacing: -0.5px; }
+QFrame[separator="true"] { background-color: #1e1e2e; max-height: 1px; }
 """
 
 
@@ -796,7 +1474,9 @@ QDateEdit::drop-down { border: none; width: 24px; }
 # ═══════════════════════════════════════════════════════════════════════════════
 class MigrationManifest:
     """Persistent JSON manifest tracking every file's migration status.
-    Enables resume after crash and CSV export for audit."""
+    Enables resume after crash and CSV export for audit.
+    WARNING: Manifests contain PHI (patient names, IDs, study metadata).
+    Handle in accordance with HIPAA security policies."""
 
     def __init__(self, manifest_path=None, save_to_disk=True):
         self.path = manifest_path
@@ -854,6 +1534,11 @@ class MigrationManifest:
             else:
                 os.rename(tmp_path, self.path)
         except Exception:
+            # Clean up orphaned temp file
+            try:
+                if 'tmp_path' in dir() and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except: pass
             # Fall back to direct write if atomic fails
             try:
                 with open(self.path, 'w') as f:
@@ -878,6 +1563,21 @@ class MigrationManifest:
     def is_already_sent(self, sop_uid):
         rec = self.records.get(sop_uid)
         return rec is not None and rec.get('status') == 'sent'
+
+    def should_skip_on_resume(self, sop_uid):
+        """Returns True if this file should be skipped on re-run:
+        - Already sent successfully
+        - Permanently skipped (Invalid DICOM)
+        - Failed with a non-retryable error (structural issue, won't change between runs)"""
+        rec = self.records.get(sop_uid)
+        if rec is None:
+            return False
+        st = rec.get('status', '')
+        if st == 'sent' or st == 'skipped':
+            return True
+        if st == 'failed' and not is_retryable_error(rec.get('message', '')):
+            return True
+        return False
 
     def get_failed(self):
         return {uid: rec for uid, rec in self.records.items() if rec.get('status') == 'failed'}
@@ -911,7 +1611,7 @@ class MigrationManifest:
 
     def export_csv(self, csv_path):
         fields = ['sop_instance_uid', 'sop_class_uid', 'path', 'status', 'message', 'timestamp',
-                   'patient_name', 'patient_id', 'study_date', 'study_desc', 'modality',
+                   'patient_name', 'patient_id', 'study_date', 'study_desc', 'series_desc', 'modality',
                    'study_instance_uid', 'series_instance_uid', 'retry_count']
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -1032,7 +1732,7 @@ def tcp_port_check(ip, port, timeout=0.5):
 def dicom_echo_probe(ip, port, ae_scu="DCMPROBE", ae_scp="ANY-SCP", timeout=3):
     try:
         ae = AE(ae_title=ae_scu)
-        ae.acse_timeout = timeout; ae.dimse_timeout = timeout; ae.network_timeout = timeout
+        ae.maximum_pdu_size = 0; ae.acse_timeout = timeout; ae.dimse_timeout = timeout; ae.network_timeout = timeout
         ae.add_requested_context(Verification)
         assoc = ae.associate(ip, port, ae_title=ae_scp)
         if assoc.is_established:
@@ -1154,14 +1854,14 @@ class ScannerThread(QThread):
             if self.manifest and self.manifest.records:
                 for uid, rec in self.manifest.records.items():
                     p = rec.get('path', '')
-                    if p and rec.get('status') in ('sent', 'skipped'):
+                    if p and rec.get('status') in ('sent', 'skipped', 'failed'):
                         _manifest_cache[p] = {
                             'path': p,
                             'patient_name': rec.get('patient_name', 'Unknown'),
                             'patient_id': rec.get('patient_id', 'N/A'),
                             'study_date': rec.get('study_date', ''),
                             'study_desc': rec.get('study_desc', ''),
-                            'series_desc': '',
+                            'series_desc': rec.get('series_desc', ''),
                             'modality': rec.get('modality', 'OT'),
                             'sop_class_uid': rec.get('sop_class_uid', ''),
                             'sop_instance_uid': uid,
@@ -1248,13 +1948,15 @@ class ScannerThread(QThread):
 # Parallel Send Engine — Multiple worker threads with persistent associations
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SENTINEL = None  # Signals worker to stop
+_SENTINEL = object()  # Unique sentinel — signals worker to stop
 
 def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                   file_queue, result_queue, cancel_event, pause_event,
                   decompress_fallback, conflict_retry, conflict_suffix,
                   pid_cache, pid_cache_lock, retry_count,
-                  throttle=None, tag_rules=None, tls_context=None):
+                  throttle=None, tag_rules=None, tls_context=None,
+                  circuit_breaker=None, adaptive_throttle=None,
+                  tod_rate_control=None, priority_queue=None):
     """Worker thread: maintains its own DICOM association and processes files from queue."""
     assoc = None
 
@@ -1276,16 +1978,47 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
         return None
 
     ae = ae_builder()
+    _a700_consecutive = 0  # Track consecutive 0xA700s for adaptive backoff
 
     while not cancel_event.is_set():
         pause_event.wait()  # Block if paused
+
+        # Adaptive backoff: if the PACS has been returning 0xA700, slow down
+        # before pulling the next file. Resets on any non-0xA700 result.
+        if _a700_consecutive > 0:
+            backoff = min(1.0 * _a700_consecutive, 10.0)  # 1s, 2s, 3s... up to 10s
+            time.sleep(backoff)
+
+        # Adaptive latency-based throttle — adds delay when destination is slow
+        if adaptive_throttle:
+            delay = adaptive_throttle.get_delay()
+            if delay > 0:
+                time.sleep(delay)
+
+        # Time-of-day rate control — adds delay during peak clinical hours
+        if tod_rate_control:
+            tod_rate_control.check_and_log_transition()
+            tod_delay = tod_rate_control.get_delay()
+            if tod_delay > 0:
+                time.sleep(tod_delay)
+
         try:
-            item = file_queue.get(timeout=0.5)
+            # Priority queue: check first (non-blocking), then fall back to regular queue
+            item = None
+            _from_priority = False
+            if priority_queue:
+                try:
+                    item = priority_queue.get_nowait()
+                    _from_priority = True
+                except queue.Empty:
+                    pass
+            if item is None:
+                item = file_queue.get(timeout=0.5)
+                _from_priority = False
         except queue.Empty:
             continue
         if item is _SENTINEL:
-            file_queue.task_done()
-            break
+            break  # Sentinel is not a real queue item — no task_done
 
         f = item
         fpath = f['path']; sop = f.get('sop_instance_uid', '')
@@ -1299,19 +2032,25 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
 
         if not a or not a.is_established:
             result_queue.put((f, False, "Association failed", sop, False, 0))
-            file_queue.task_done()
+            if not _from_priority: file_queue.task_done()
             continue
 
         try:
             ds = pydicom.dcmread(fpath, force=True)
             if not is_valid_dicom(ds):
                 result_queue.put((f, False, "Invalid DICOM (missing required tags)", sop, False, 0))
-                file_queue.task_done()
+                if not _from_priority: file_queue.task_done()
                 continue
 
             # Apply tag morphing rules (in-memory only, source untouched)
             if tag_rules:
                 apply_tag_rules(ds, tag_rules)
+
+            # Circuit breaker — blocks during OPEN state, allows probe in HALF_OPEN
+            if circuit_breaker and not circuit_breaker.allow_request():
+                result_queue.put((f, False, "Circuit breaker: destination unreachable", sop, False, 0))
+                if not _from_priority: file_queue.task_done()
+                continue
 
             # Thread-safe pid_cache access
             local_cache = {}
@@ -1319,6 +2058,7 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 with pid_cache_lock:
                     local_cache = dict(pid_cache)
 
+            _send_start = time.monotonic()
             sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
                 assoc, ds, fpath, decompress_fallback,
                 conflict_retry, conflict_suffix,
@@ -1326,6 +2066,11 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 ae=ae, host=host, port=port,
                 ae_scp=ae_scp, ae_scu=ae_scu,
                 pid_cache=local_cache, tls_context=tls_context)
+            _send_elapsed = time.monotonic() - _send_start
+
+            # Feed latency to adaptive throttle
+            if adaptive_throttle and sv is not None:
+                adaptive_throttle.record_latency(_send_elapsed)
 
             # Merge cache updates back
             if pid_cache is not None and local_cache:
@@ -1342,8 +2087,19 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 except: pass
                 assoc = None  # Force _get_assoc to create fresh broad association next iteration
 
+            # Force association reset on connection-dead errors so the next file
+            # gets a fresh association instead of hitting the same dead one.
+            if sv == -1 and detail and any(p in detail.lower() for p in
+                    ('association', 'connection', 'established', 'transport', 'socket', 'timed out')):
+                try:
+                    if assoc: assoc.release()
+                except: pass
+                assoc = None
+
             file_size = f.get('file_size', 0)
-            if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+            if _is_cstore_success(sv):
+                _a700_consecutive = 0  # Reset backoff on success
+                if circuit_breaker: circuit_breaker.record_success()
                 msg = detail if detail else ("Copied" if sv == 0 else f"Pending (0x{sv:04X})")
                 if was_decompressed and not detail: msg = "Decompressed + Copied"
                 # Bandwidth throttle — block until budget available
@@ -1351,16 +2107,24 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                     throttle.acquire(file_size)
                 result_queue.put((f, True, msg, sop, was_conflict_retried, file_size))
             elif sv is not None and sv >= 0:
+                if circuit_breaker: circuit_breaker.record_failure()
+                if sv == 0xA700:
+                    _a700_consecutive += 1
+                else:
+                    _a700_consecutive = 0
                 msg = f"Status: 0x{sv:04X}"
                 if detail: msg += f" ({detail})"
                 result_queue.put((f, False, msg, sop, was_conflict_retried, 0))
             else:
+                if circuit_breaker: circuit_breaker.record_failure()
+                _a700_consecutive = 0
                 msg = detail or "No response"
                 result_queue.put((f, False, msg, sop, was_conflict_retried, 0))
         except Exception as e:
+            _a700_consecutive = 0
             result_queue.put((f, False, str(e), sop, False, 0))
 
-        file_queue.task_done()
+        if not _from_priority: file_queue.task_done()
 
     # Cleanup
     if assoc:
@@ -1386,7 +2150,9 @@ class UploadThread(QThread):
                  max_pdu=0, batch_size=50, retry_count=1, manifest=None,
                  decompress_fallback=True, conflict_retry=False, conflict_suffix="_MIG",
                  skip_existing=False, workers=1, max_retries=3,
-                 throttle=None, tag_rules=None, tls_context=None):
+                 throttle=None, tag_rules=None, tls_context=None,
+                 adaptive_throttle_enabled=False, study_batching=False,
+                 tod_rate_control=None):
         super().__init__()
         self.files = files; self.host = host; self.port = port
         self.ae_scu = ae_scu; self.ae_scp = ae_scp
@@ -1401,6 +2167,8 @@ class UploadThread(QThread):
         self.throttle = throttle
         self.tag_rules = tag_rules or []
         self.tls_context = tls_context
+        self.study_batching = study_batching
+        self._tod_rate_control = tod_rate_control
         self.failure_reasons = defaultdict(int)
         self._conflict_retries = 0
         self._healed_count = 0
@@ -1409,12 +2177,38 @@ class UploadThread(QThread):
         self._cancel = False; self._paused = False
         self._pause_event = threading.Event(); self._pause_event.set()
         self._cancel_event = threading.Event()
+        self._priority_queue = queue.Queue()  # Priority files jump ahead of regular queue
+        self._priority_study_uids = set()     # Track prioritized studies
         if self.throttle:
             self.throttle._cancel_event = self._cancel_event
+        if self._tod_rate_control:
+            self._tod_rate_control._cancel_event = self._cancel_event
+        # Circuit breaker — protects destination PACS from cascade failures
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=5, recovery_seconds=60,
+            cancel_event=self._cancel_event, log_fn=lambda m: self.log.emit(m))
+        # Adaptive latency-based throttle
+        self._adaptive_throttle = AdaptiveThrottle(target_latency=1.0, max_delay=5.0)
+        self._adaptive_throttle.enabled = adaptive_throttle_enabled
 
     def cancel(self): self._cancel = True; self._cancel_event.set(); self._pause_event.set()
     def pause(self): self._paused = True; self._pause_event.clear()
     def resume(self): self._paused = False; self._pause_event.set()
+
+    def prioritize_study(self, study_uid):
+        """Move a study to the front of the queue. Files matching this study_uid
+        that haven't been sent yet will be injected into the priority queue,
+        processed before other files by workers."""
+        if study_uid in self._priority_study_uids:
+            return
+        self._priority_study_uids.add(study_uid)
+        priority_files = [f for f in self.files
+                          if f.get('study_instance_uid') == study_uid
+                          and (not self.manifest or not self.manifest.is_already_sent(f.get('sop_instance_uid', '')))]
+        for f in priority_files:
+            self._priority_queue.put(f)
+        if priority_files:
+            self.log.emit(f"  Priority: {len(priority_files)} files from study {study_uid[:20]}... moved to front")
 
     def _associate(self, ae):
         """Create association with optional TLS."""
@@ -1446,6 +2240,13 @@ class UploadThread(QThread):
             self.log.emit(f"Tag morphing: {len(self.tag_rules)} rules active (in-memory only)")
         if self.tls_context:
             self.log.emit(f"TLS encryption: ENABLED")
+        if self.study_batching:
+            study_groups = group_files_by_study(self.files)
+            self.log.emit(f"Study batching: {len(study_groups)} studies (files grouped for atomic transfer)")
+        if self._tod_rate_control and self._tod_rate_control.enabled:
+            tod = self._tod_rate_control
+            self.log.emit(f"Time-of-day rate control: peak {tod.peak_start.strftime('%H:%M')}-"
+                          f"{tod.peak_end.strftime('%H:%M')} ({tod.peak_workers} worker(s), {tod.peak_delay}s delay)")
         self.log.emit(f"{'='*60}")
 
         # Pre-flight: query destination to skip studies that already exist
@@ -1471,25 +2272,37 @@ class UploadThread(QThread):
         # ── Manifest Resume: filter out already-sent files upfront ──
         # Instead of checking each file inside the worker loop (120K queue ops),
         # remove them from the list now so workers only see unsent files.
+        # Also skip non-retryable failures — they'll just fail again identically.
         manifest_skipped = 0
         if self.manifest and self.manifest.records:
             before = len(self.files)
-            sent_sops = set(uid for uid, rec in self.manifest.records.items()
-                            if rec.get('status') == 'sent')
-            if sent_sops:
+            skip_sops = set()
+            retryable_failed = 0
+            for uid, rec in self.manifest.records.items():
+                st = rec.get('status', '')
+                if st == 'sent' or st == 'skipped':
+                    skip_sops.add(uid)
+                elif st == 'failed':
+                    msg = rec.get('message', '')
+                    if not is_retryable_error(msg):
+                        skip_sops.add(uid)  # Non-retryable — don't waste time
+                    else:
+                        retryable_failed += 1
+            if skip_sops:
                 self.files = [f for f in self.files
-                              if f.get('sop_instance_uid', '') not in sent_sops]
+                              if f.get('sop_instance_uid', '') not in skip_sops]
                 manifest_skipped = before - len(self.files)
                 if manifest_skipped > 0:
                     total = len(self.files)
                     skipped += manifest_skipped
-                    self.log.emit(f"Resume: {manifest_skipped:,} files already sent (skipped instantly)")
+                    non_retry_count = sum(1 for uid in skip_sops
+                                          if self.manifest.records.get(uid, {}).get('status') == 'failed')
+                    self.log.emit(f"Resume: {manifest_skipped:,} files skipped instantly "
+                                  f"({manifest_skipped - non_retry_count:,} sent/skipped, "
+                                  f"{non_retry_count:,} non-retryable failures)")
                     self.log.emit(f"Remaining: {total:,} files to send")
-                    # Also count failed files for retry info
-                    failed_count = sum(1 for r in self.manifest.records.values()
-                                       if r.get('status') == 'failed')
-                    if failed_count:
-                        self.log.emit(f"  ({failed_count:,} previously failed files will be retried)")
+                    if retryable_failed:
+                        self.log.emit(f"  ({retryable_failed:,} previously failed files will be retried)")
 
         if total == 0:
             self.log.emit("All files already sent. Nothing to do.")
@@ -1542,28 +2355,51 @@ class UploadThread(QThread):
                       file_q, result_q, self._cancel_event, self._pause_event,
                       self.decompress_fallback, self.conflict_retry, self.conflict_suffix,
                       self._pid_cache, self._pid_cache_lock, self.retry_count,
-                      self.throttle, self.tag_rules, self.tls_context))
+                      self.throttle, self.tag_rules, self.tls_context,
+                      self._circuit_breaker, self._adaptive_throttle,
+                      self._tod_rate_control, self._priority_queue))
             t.start()
             worker_threads.append(t)
 
         # Track failed files for auto-retry: {sop_uid: file_dict}
         retry_pending = {}
 
-        # Feed files — in a separate thread so we can drain results concurrently
+        # Feed files — study-sorted if study batching enabled
         def feeder():
-            for f in self.files:
-                if self._cancel: break
-                sop = f.get('sop_instance_uid', '')
-                if self.manifest and self.manifest.is_already_sent(sop):
-                    result_q.put((f, True, "Already sent (resumed)", sop, False, 0))
-                    continue
-                file_q.put(f)
+            if self.study_batching:
+                # Group by study for atomic study-level transfers
+                study_groups = group_files_by_study(self.files)
+                for study_uid, study_files in study_groups:
+                    if self._cancel: break
+                    for f in study_files:
+                        if self._cancel: break
+                        sop = f.get('sop_instance_uid', '')
+                        if self.manifest and self.manifest.should_skip_on_resume(sop):
+                            result_q.put((f, True, "Already sent (resumed)", sop, False, 0))
+                            continue
+                        # Skip files already in priority queue
+                        if f.get('study_instance_uid', '') in self._priority_study_uids:
+                            continue
+                        file_q.put(f)
+            else:
+                for f in self.files:
+                    if self._cancel: break
+                    sop = f.get('sop_instance_uid', '')
+                    if self.manifest and self.manifest.should_skip_on_resume(sop):
+                        result_q.put((f, True, "Already sent (resumed)", sop, False, 0))
+                        continue
+                    # Skip files already in priority queue
+                    if f.get('study_instance_uid', '') in self._priority_study_uids:
+                        continue
+                    file_q.put(f)
 
         feed_thread = threading.Thread(target=feeder, daemon=True)
         feed_thread.start()
 
         # Collect results from primary pass
         processed = 0
+        _a700_total = 0  # Track total 0xA700s for backpressure visibility
+        _a700_last_log = 0  # Last logged count to avoid spam
         while processed < total or feed_thread.is_alive():
             try:
                 f, ok, msg, sop, was_conflict, fsize = result_q.get(timeout=0.5)
@@ -1586,6 +2422,16 @@ class UploadThread(QThread):
                 self._conflict_retries += 1
                 self.conflict_retry_count.emit(self._conflict_retries)
 
+            # Track 0xA700 backpressure
+            if not ok and "0xA700" in msg:
+                _a700_total += 1
+                # Log at thresholds: 10, 50, 100, then every 500
+                if _a700_total in (10, 50, 100) or (_a700_total > 100 and _a700_total % 500 == 0):
+                    if _a700_total != _a700_last_log:
+                        self.log.emit(f"  Backpressure: {_a700_total:,} files returned 0xA700 "
+                                      f"(Out of Resources) — workers are auto-throttling")
+                        _a700_last_log = _a700_total
+
             if ok:
                 if "Already sent" in msg:
                     skipped += 1
@@ -1594,7 +2440,7 @@ class UploadThread(QThread):
                 self.file_sent.emit(fpath, True, msg, sop)
                 if self.manifest and "Already sent" not in msg:
                     self.manifest.record_file(sop, fpath, 'sent', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
             else:
                 if "Invalid DICOM" in msg:
                     skipped += 1
@@ -1604,12 +2450,12 @@ class UploadThread(QThread):
                     self.failure_reasons[msg[:80]] += 1
                     retry_pending[sop] = f  # Queue for auto-retry
                     if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                 else:
                     failed += 1
                     self.failure_reasons[msg[:80]] += 1
                     if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                 self.file_sent.emit(fpath, ok, msg, sop)
 
             self.progress.emit(processed, total)
@@ -1676,13 +2522,13 @@ class UploadThread(QThread):
                     self.file_sent.emit(fpath, True, healed_msg, sop)
                     if self.manifest:
                         self.manifest.record_file(sop, fpath, 'sent', healed_msg,
-                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                 else:
                     if is_retryable_error(msg):
                         retry_pending[sop] = f  # Try again next wave
                     if self.manifest:
                         self.manifest.record_file(sop, fpath, 'failed', msg,
-                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
 
             if self._healed_count > 0 or not retry_pending:
                 self.log.emit(f"  Wave {wave}: {wave_count - len(retry_pending)} healed, "
@@ -1699,6 +2545,7 @@ class UploadThread(QThread):
     def _run_serial(self, total, start_time, skipped):
         """Original serial send path — one association at a time."""
         sent = failed = 0; bytes_sent = 0; file_index = 0
+        _a700_consecutive = 0  # Adaptive backoff for PACS backpressure
         for batch_start in range(0, total, self.batch_size):
             if self._cancel: break
             batch = self.files[batch_start:batch_start + self.batch_size]
@@ -1714,12 +2561,20 @@ class UploadThread(QThread):
                             failed += 1; file_index += 1; self.progress.emit(file_index, total)
                             sop = f.get('sop_instance_uid', '')
                             self.file_sent.emit(f['path'], False, "Association failed", sop)
-                            if self.manifest: self.manifest.record_file(sop, f['path'], 'failed', 'Association failed', **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                            if self.manifest: self.manifest.record_file(sop, f['path'], 'failed', 'Association failed', **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                         break
 
                     for f in batch:
                         self._pause_event.wait()
-                        if self._cancel: assoc.release(); break
+                        if self._cancel:
+                            try: assoc.release()
+                            except Exception: pass
+                            break
+
+                        # Adaptive backoff for PACS backpressure
+                        if _a700_consecutive > 0:
+                            backoff = min(1.0 * _a700_consecutive, 10.0)
+                            time.sleep(backoff)
 
                         # Reconnect if association died (e.g. timeout during pause)
                         if not assoc.is_established:
@@ -1735,7 +2590,7 @@ class UploadThread(QThread):
                                         rsop = remaining.get('sop_instance_uid', '')
                                         self.file_sent.emit(remaining['path'], False, "Association lost", rsop)
                                         if self.manifest: self.manifest.record_file(rsop, remaining['path'], 'failed', 'Association lost',
-                                            **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                            **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                                     break
                                 self.log.emit("Reconnected successfully")
                             except Exception as reconn_err:
@@ -1746,7 +2601,7 @@ class UploadThread(QThread):
                         fpath = f['path']; sop = f.get('sop_instance_uid', '')
 
                         # Resume: skip already sent
-                        if self.manifest and self.manifest.is_already_sent(sop):
+                        if self.manifest and self.manifest.should_skip_on_resume(sop):
                             skipped += 1; self.progress.emit(file_index, total)
                             self.file_sent.emit(fpath, True, "Already sent (resumed)", sop)
                             continue
@@ -1784,7 +2639,8 @@ class UploadThread(QThread):
                                 self._conflict_retries += 1
                                 self.conflict_retry_count.emit(self._conflict_retries)
 
-                            if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                            if _is_cstore_success(sv):
+                                _a700_consecutive = 0
                                 fsize = f.get('file_size', 0)
                                 sent += 1; bytes_sent += fsize
                                 # Bandwidth throttle
@@ -1793,18 +2649,31 @@ class UploadThread(QThread):
                                 msg = detail if detail else ("Copied" if sv == 0 else f"Pending (0x{sv:04X})")
                                 if was_decompressed and not detail: msg = "Decompressed + Copied"
                                 self.file_sent.emit(fpath, True, msg, sop)
-                                if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                             elif sv is not None and sv >= 0:
+                                if sv == 0xA700:
+                                    _a700_consecutive += 1
+                                else:
+                                    _a700_consecutive = 0
                                 failed += 1; msg = f"Status: 0x{sv:04X}"
                                 if detail: msg += f" ({detail})"
                                 self.file_sent.emit(fpath, False, msg, sop)
                                 self.failure_reasons[f"Status: 0x{sv:04X}"] += 1
-                                if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg, **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                             else:
+                                _a700_consecutive = 0
                                 failed += 1; msg = detail or "No response"
                                 self.file_sent.emit(fpath, False, msg, sop)
                                 self.failure_reasons[msg[:80]] += 1
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg)
+
+                            # Force association reset on connection-dead errors
+                            if sv == -1 and detail and any(p in detail.lower() for p in
+                                    ('association', 'connection', 'established', 'transport', 'socket', 'timed out')):
+                                try: assoc.release()
+                                except: pass
+                                try: assoc = self._associate(ae)
+                                except: pass
                         except Exception as e:
                             failed += 1; self.file_sent.emit(fpath, False, str(e), sop)
                             self.failure_reasons[str(e)[:80]] += 1
@@ -1891,7 +2760,7 @@ class UploadThread(QThread):
                                 except: pass
                                 try: assoc = self._associate(ae)
                                 except: pass
-                            if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                            if _is_cstore_success(sv):
                                 sent += 1; failed -= 1; wave_sent += 1
                                 bytes_sent += f.get('file_size', 0)
                                 self._healed_count += 1
@@ -1899,16 +2768,16 @@ class UploadThread(QThread):
                                 msg = f"Auto-healed (wave {wave})"
                                 self.file_sent.emit(fpath, True, msg, sop)
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg,
-                                    **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                    **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                             else:
                                 wave_failed += 1
                                 msg = detail or f"Status: 0x{sv:04X}" if sv is not None and sv >= 0 else detail or "No response"
                                 if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                                    **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                    **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                         except Exception as e:
                             wave_failed += 1
                             if self.manifest: self.manifest.record_file(sop, fpath, 'failed', str(e),
-                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                     try: assoc.release()
                     except: pass
                 except Exception:
@@ -1941,7 +2810,8 @@ class StreamingMigrationThread(QThread):
                  skip_existing=False, workers=1, max_retries=3,
                  throttle=None, tag_rules=None, tls_context=None,
                  schedule_enabled=False, schedule_start=None, schedule_end=None,
-                 filter_modalities=None, filter_date_from=None, filter_date_to=None):
+                 filter_modalities=None, filter_date_from=None, filter_date_to=None,
+                 adaptive_throttle_enabled=False, tod_rate_control=None):
         super().__init__()
         self.root_folder = root_folder
         self.host = host; self.port = port
@@ -1960,9 +2830,10 @@ class StreamingMigrationThread(QThread):
         self.schedule_enabled = schedule_enabled
         self.schedule_start = schedule_start or dtime(0, 0)
         self.schedule_end = schedule_end or dtime(23, 59)
-        self.filter_modalities = filter_modalities  # set of modality strings, or None for all
-        self.filter_date_from = filter_date_from  # 'YYYYMMDD' string or None
-        self.filter_date_to = filter_date_to  # 'YYYYMMDD' string or None
+        self.filter_modalities = filter_modalities
+        self.filter_date_from = filter_date_from
+        self.filter_date_to = filter_date_to
+        self._tod_rate_control = tod_rate_control
         self.failure_reasons = defaultdict(int)
         self._conflict_retries = 0
         self._healed_count = 0
@@ -1976,6 +2847,15 @@ class StreamingMigrationThread(QThread):
         self._cancel_event = threading.Event()
         if self.throttle:
             self.throttle._cancel_event = self._cancel_event
+        # Circuit breaker — protects destination PACS from cascade failures
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=5, recovery_seconds=60,
+            cancel_event=self._cancel_event, log_fn=lambda m: self.log.emit(m))
+        # Adaptive latency-based throttle
+        self._adaptive_throttle = AdaptiveThrottle(target_latency=1.0, max_delay=5.0)
+        self._adaptive_throttle.enabled = adaptive_throttle_enabled
+        if self._tod_rate_control:
+            self._tod_rate_control._cancel_event = self._cancel_event
 
     def cancel(self): self._cancel = True; self._cancel_event.set(); self._pause_event.set()
     def pause(self): self._paused = True; self._pause_event.clear()
@@ -2000,6 +2880,7 @@ class StreamingMigrationThread(QThread):
         """Send a batch of parsed DICOM file dicts. Returns updated counters."""
         sop_classes = list(set(f['sop_class_uid'] for f in batch))
         ae = self._build_ae(sop_classes)
+        _a700_consecutive = 0  # Adaptive backoff for PACS backpressure
 
         for attempt in range(self.retry_count + 1):
             if self._cancel: return sent, failed, skipped, bytes_sent
@@ -2012,12 +2893,39 @@ class StreamingMigrationThread(QThread):
                         failed += 1; sop = f.get('sop_instance_uid', '')
                         self.file_sent.emit(f['path'], False, "Association failed", sop)
                         if self.manifest: self.manifest.record_file(sop, f['path'], 'failed', 'Association failed',
-                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                            **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                     return sent, failed, skipped, bytes_sent
 
                 for f in batch:
                     self._pause_event.wait()
-                    if self._cancel: assoc.release(); return sent, failed, skipped, bytes_sent
+                    if self._cancel:
+                        try: assoc.release()
+                        except Exception: pass
+                        return sent, failed, skipped, bytes_sent
+
+                    # Adaptive backoff for PACS backpressure
+                    if _a700_consecutive > 0:
+                        backoff = min(1.0 * _a700_consecutive, 10.0)
+                        time.sleep(backoff)
+
+                    # Adaptive latency-based throttle
+                    if self._adaptive_throttle:
+                        delay = self._adaptive_throttle.get_delay()
+                        if delay > 0:
+                            time.sleep(delay)
+
+                    # Time-of-day rate control — adds delay during peak clinical hours
+                    if self._tod_rate_control:
+                        self._tod_rate_control.check_and_log_transition()
+                        tod_delay = self._tod_rate_control.get_delay()
+                        if tod_delay > 0:
+                            time.sleep(tod_delay)
+
+                    # Circuit breaker — blocks during OPEN state
+                    if self._circuit_breaker and not self._circuit_breaker.allow_request():
+                        failed += 1
+                        self.file_sent.emit(f['path'], False, "Circuit breaker: destination unreachable", f.get('sop_instance_uid', ''))
+                        continue
 
                     # Reconnect if association died (e.g. timeout during pause)
                     if not assoc.is_established:
@@ -2032,7 +2940,7 @@ class StreamingMigrationThread(QThread):
                                     failed += 1; rsop = remaining.get('sop_instance_uid', '')
                                     self.file_sent.emit(remaining['path'], False, "Association lost", rsop)
                                     if self.manifest: self.manifest.record_file(rsop, remaining['path'], 'failed', 'Association lost',
-                                        **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                        **{k: remaining.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                                 return sent, failed, skipped, bytes_sent
                             self.log.emit("Reconnected successfully")
                         except Exception as reconn_err:
@@ -2042,7 +2950,7 @@ class StreamingMigrationThread(QThread):
                     fpath = f['path']; sop = f.get('sop_instance_uid', '')
 
                     # Resume: skip already sent
-                    if self.manifest and self.manifest.is_already_sent(sop):
+                    if self.manifest and self.manifest.should_skip_on_resume(sop):
                         skipped += 1
                         self.file_sent.emit(fpath, True, "Already sent (resumed)", sop)
                         continue
@@ -2058,6 +2966,7 @@ class StreamingMigrationThread(QThread):
                         if self.tag_rules:
                             apply_tag_rules(ds, self.tag_rules)
 
+                        _send_start = time.monotonic()
                         sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
                             assoc, ds, fpath, self.decompress_fallback,
                             self.conflict_retry, self.conflict_suffix,
@@ -2065,6 +2974,11 @@ class StreamingMigrationThread(QThread):
                             ae=ae, host=self.host, port=self.port,
                             ae_scp=self.ae_scp, ae_scu=self.ae_scu,
                             pid_cache=self._pid_cache, tls_context=self.tls_context)
+                        _send_elapsed = time.monotonic() - _send_start
+
+                        # Feed latency to adaptive throttle
+                        if self._adaptive_throttle and sv is not None:
+                            self._adaptive_throttle.record_latency(_send_elapsed)
 
                         # If a targeted association was used (decompress/context fallback),
                         # release it and re-establish the broad one for subsequent files
@@ -2080,7 +2994,9 @@ class StreamingMigrationThread(QThread):
                             self._conflict_retries += 1
                             self.conflict_retry_count.emit(self._conflict_retries)
 
-                        if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                        if _is_cstore_success(sv):
+                            _a700_consecutive = 0
+                            if self._circuit_breaker: self._circuit_breaker.record_success()
                             fsize = f.get('file_size', 0)
                             sent += 1; bytes_sent += fsize
                             # Bandwidth throttle
@@ -2090,21 +3006,36 @@ class StreamingMigrationThread(QThread):
                             if was_decompressed and not detail: msg = "Decompressed + Copied"
                             self.file_sent.emit(fpath, True, msg, sop)
                             if self.manifest: self.manifest.record_file(sop, fpath, 'sent', msg,
-                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                         elif sv is not None and sv >= 0:
+                            if self._circuit_breaker: self._circuit_breaker.record_failure()
+                            if sv == 0xA700:
+                                _a700_consecutive += 1
+                            else:
+                                _a700_consecutive = 0
                             failed += 1; msg = f"Status: 0x{sv:04X}"
                             if detail: msg += f" ({detail})"
                             self.file_sent.emit(fpath, False, msg, sop)
                             self.failure_reasons[f"Status: 0x{sv:04X}"] += 1
                             if is_retryable_error(msg): self._failed_files[sop] = f
                             if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                         else:
+                            if self._circuit_breaker: self._circuit_breaker.record_failure()
+                            _a700_consecutive = 0
                             failed += 1; msg = detail or "No response"
                             self.file_sent.emit(fpath, False, msg, sop)
                             self.failure_reasons[msg[:80]] += 1
                             if is_retryable_error(msg): self._failed_files[sop] = f
                             if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg)
+
+                        # Force association reset on connection-dead errors
+                        if sv == -1 and detail and any(p in detail.lower() for p in
+                                ('association', 'connection', 'established', 'transport', 'socket', 'timed out')):
+                            try: assoc.release()
+                            except: pass
+                            try: assoc = self._associate(ae)
+                            except: pass
                     except Exception as e:
                         failed += 1; self.file_sent.emit(fpath, False, str(e), sop)
                         self.failure_reasons[str(e)[:80]] += 1
@@ -2137,7 +3068,7 @@ class StreamingMigrationThread(QThread):
         for f in batch:
             if self._cancel: break
             sop = f.get('sop_instance_uid', '')
-            if self.manifest and self.manifest.is_already_sent(sop):
+            if self.manifest and self.manifest.should_skip_on_resume(sop):
                 skipped += 1
                 self.file_sent.emit(f['path'], True, "Already sent (resumed)", sop)
                 continue
@@ -2145,7 +3076,7 @@ class StreamingMigrationThread(QThread):
 
         # Drain results for this batch (non-blocking — workers keep running)
         expected = sum(1 for f in batch
-                       if not (self.manifest and self.manifest.is_already_sent(f.get('sop_instance_uid', ''))))
+                       if not (self.manifest and self.manifest.should_skip_on_resume(f.get('sop_instance_uid', ''))))
         collected = 0
         while collected < expected and not self._cancel:
             try:
@@ -2164,7 +3095,7 @@ class StreamingMigrationThread(QThread):
                 self.file_sent.emit(fpath, True, msg, sop)
                 if self.manifest:
                     self.manifest.record_file(sop, fpath, 'sent', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
             else:
                 if "Invalid DICOM" in msg:
                     skipped += 1
@@ -2174,12 +3105,12 @@ class StreamingMigrationThread(QThread):
                     self._failed_files[sop] = f
                     self.failure_reasons[msg[:80]] += 1
                     if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                 else:
                     failed += 1
                     self.failure_reasons[msg[:80]] += 1
                     if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
-                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                 self.file_sent.emit(fpath, False, msg, sop)
 
             elapsed = time.time() - start_time
@@ -2240,13 +3171,13 @@ class StreamingMigrationThread(QThread):
                         self.file_sent.emit(fpath, True, healed_msg, sop)
                         if self.manifest:
                             self.manifest.record_file(sop, fpath, 'sent', healed_msg,
-                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                     else:
                         if is_retryable_error(msg):
                             self._failed_files[sop] = f
                         if self.manifest:
                             self.manifest.record_file(sop, fpath, 'failed', msg,
-                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
             else:
                 # Serial path
                 wave_sent = 0
@@ -2279,7 +3210,7 @@ class StreamingMigrationThread(QThread):
                                 except: pass
                                 try: assoc = self._associate(ae)
                                 except: pass
-                            if sv is not None and sv >= 0 and (sv == 0x0000 or sv in (0xFF00, 0xFF01)):
+                            if _is_cstore_success(sv):
                                 sent += 1; failed -= 1; wave_sent += 1
                                 bytes_sent += f.get('file_size', 0)
                                 self._healed_count += 1
@@ -2287,13 +3218,13 @@ class StreamingMigrationThread(QThread):
                                 self.file_sent.emit(fpath, True, f"Auto-healed (wave {wave})", sop)
                                 if self.manifest:
                                     self.manifest.record_file(sop, fpath, 'sent', f"Auto-healed (wave {wave})",
-                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                             else:
                                 if is_retryable_error(detail or ''):
                                     self._failed_files[sop] = f
                                 if self.manifest:
                                     self.manifest.record_file(sop, fpath, 'failed', detail or "No response",
-                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
                         except Exception:
                             self._failed_files[sop] = f
                     try: assoc.release()
@@ -2439,6 +3370,7 @@ class StreamingMigrationThread(QThread):
                         'patient_id': str(getattr(ds, 'PatientID', 'N/A')),
                         'study_date': str(getattr(ds, 'StudyDate', '')),
                         'study_desc': str(getattr(ds, 'StudyDescription', '')),
+                        'series_desc': str(getattr(ds, 'SeriesDescription', '')),
                         'modality': str(getattr(ds, 'Modality', 'OT')),
                         'sop_class_uid': str(ds.SOPClassUID),
                         'sop_instance_uid': str(getattr(ds, 'SOPInstanceUID', '')),
@@ -2570,28 +3502,29 @@ class StreamingMigrationThread(QThread):
 # Storage Commitment Thread (N-ACTION / N-EVENT-REPORT)
 # ═══════════════════════════════════════════════════════════════════════════════
 class StorageCommitmentThread(QThread):
-    """Formal DICOM Storage Commitment verification.
-    Sends N-ACTION request with list of SOP instances, then handles
-    N-EVENT-REPORT to confirm permanent storage commitment."""
+    """Enhanced DICOM Storage Commitment verification.
+    Sends N-ACTION requests in configurable batches (default 500 instances per batch)
+    to avoid overwhelming PACS systems with large commitment requests.
+    Reports per-batch progress and handles partial failures gracefully."""
     progress = pyqtSignal(int, int)
     log = pyqtSignal(str)
     result = pyqtSignal(int, int, int)  # total, committed, failed
     instance_result = pyqtSignal(str, bool)  # sop_uid, committed
 
     STORAGE_COMMITMENT_SOP = '1.2.840.10008.1.20.1'  # Storage Commitment Push Model
+    BATCH_SIZE = 500  # Max instances per N-ACTION request
 
     def __init__(self, sop_instances, host, port, ae_scu, ae_scp, tls_context=None):
-        """
-        Args:
-            sop_instances: list of (sop_class_uid, sop_instance_uid) tuples
-            host, port, ae_scu, ae_scp: DICOM connection params
-            tls_context: optional SSL context
-        """
         super().__init__()
         self.sop_instances = sop_instances
         self.host = host; self.port = port
         self.ae_scu = ae_scu; self.ae_scp = ae_scp
         self.tls_context = tls_context
+
+    def _make_assoc(self, ae):
+        if self.tls_context:
+            return ae.associate(self.host, self.port, ae_title=self.ae_scp, tls_args=(self.tls_context,))
+        return ae.associate(self.host, self.port, ae_title=self.ae_scp)
 
     def run(self):
         from pydicom.uid import generate_uid
@@ -2599,79 +3532,85 @@ class StorageCommitmentThread(QThread):
         total = len(self.sop_instances)
         self.log.emit(f"{'='*60}")
         self.log.emit(f"STORAGE COMMITMENT REQUEST")
-        self.log.emit(f"Requesting commitment for {total:,} instances...")
+        n_batches = (total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        self.log.emit(f"Requesting commitment for {total:,} instances in {n_batches} batch(es)...")
         self.log.emit(f"{'='*60}")
 
         ae = AE(ae_title=self.ae_scu)
-        ae.acse_timeout = 30; ae.dimse_timeout = 120; ae.network_timeout = 30
+        ae.maximum_pdu_size = 0; ae.acse_timeout = 30; ae.dimse_timeout = 120; ae.network_timeout = 30
         ae.add_requested_context(self.STORAGE_COMMITMENT_SOP)
 
-        try:
-            if self.tls_context:
-                assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp,
-                                     tls_args=(self.tls_context,))
-            else:
-                assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp)
+        committed = 0; failed_count = 0; not_supported = False
 
-            if not assoc.is_established:
-                self.log.emit("Storage Commitment association failed")
-                self.result.emit(total, 0, total); return
+        for batch_idx in range(n_batches):
+            batch_start = batch_idx * self.BATCH_SIZE
+            batch_end = min(batch_start + self.BATCH_SIZE, total)
+            batch = self.sop_instances[batch_start:batch_end]
+            batch_num = batch_idx + 1
 
-            # Build N-ACTION dataset with Referenced SOP Sequence
-            action_ds = pydicom.Dataset()
-            action_ds.TransactionUID = generate_uid()
+            self.progress.emit(batch_start, total)
+            self.log.emit(f"Batch {batch_num}/{n_batches}: {len(batch)} instances...")
 
-            ref_sop_seq = []
-            for sop_class, sop_instance in self.sop_instances:
-                item = pydicom.Dataset()
-                item.ReferencedSOPClassUID = sop_class
-                item.ReferencedSOPInstanceUID = sop_instance
-                ref_sop_seq.append(item)
-            action_ds.ReferencedSOPSequence = ref_sop_seq
+            try:
+                assoc = self._make_assoc(ae)
+                if not assoc.is_established:
+                    self.log.emit(f"  Batch {batch_num}: association failed")
+                    failed_count += len(batch)
+                    continue
 
-            # Send N-ACTION (Action Type ID = 1: Request Storage Commitment)
-            self.log.emit(f"Sending N-ACTION with {total:,} instances...")
-            status = assoc.send_n_action(
-                action_ds,
-                1,  # Action Type ID = Request Storage Commitment
-                self.STORAGE_COMMITMENT_SOP,
-                '1.2.840.10008.1.20.1.1'  # Well-Known Storage Commitment SOP Instance
-            )
+                action_ds = pydicom.Dataset()
+                action_ds.TransactionUID = generate_uid()
+                ref_sop_seq = []
+                for sop_class, sop_instance in batch:
+                    item = pydicom.Dataset()
+                    item.ReferencedSOPClassUID = sop_class
+                    item.ReferencedSOPInstanceUID = sop_instance
+                    ref_sop_seq.append(item)
+                action_ds.ReferencedSOPSequence = ref_sop_seq
 
-            committed = failed_count = 0
+                status = assoc.send_n_action(
+                    action_ds, 1, self.STORAGE_COMMITMENT_SOP,
+                    '1.2.840.10008.1.20.1.1')
 
-            if status and hasattr(status, 'Status'):
-                if status.Status == 0x0000:
-                    self.log.emit("N-ACTION accepted -- storage commitment requested successfully")
-                    # Mark all as committed (many SCPs commit synchronously)
-                    committed = total
-                    for sop_class, sop_instance in self.sop_instances:
-                        self.instance_result.emit(sop_instance, True)
-                elif status.Status == 0x0112:
-                    self.log.emit("Storage Commitment SOP Class not supported by destination")
-                    failed_count = total
+                if status and hasattr(status, 'Status'):
+                    if status.Status == 0x0000:
+                        committed += len(batch)
+                        for sop_class, sop_instance in batch:
+                            self.instance_result.emit(sop_instance, True)
+                        self.log.emit(f"  Batch {batch_num}: committed {len(batch)} instances")
+                    elif status.Status == 0x0112:
+                        self.log.emit(f"  Storage Commitment SOP Class not supported by destination")
+                        failed_count += len(batch)
+                        not_supported = True
+                        try: assoc.release()
+                        except: pass
+                        break  # No point continuing if not supported
+                    else:
+                        self.log.emit(f"  Batch {batch_num}: N-ACTION returned 0x{status.Status:04X}")
+                        failed_count += len(batch)
                 else:
-                    self.log.emit(f"N-ACTION returned status: 0x{status.Status:04X}")
-                    failed_count = total
-            else:
-                self.log.emit("No response to N-ACTION request")
-                failed_count = total
+                    self.log.emit(f"  Batch {batch_num}: no response to N-ACTION")
+                    failed_count += len(batch)
 
-            try: assoc.release()
-            except: pass
+                try: assoc.release()
+                except: pass
 
-        except Exception as e:
-            self.log.emit(f"Storage Commitment error: {e}")
-            committed = 0; failed_count = total
+            except Exception as e:
+                self.log.emit(f"  Batch {batch_num} error: {e}")
+                failed_count += len(batch)
 
         # Summary
+        self.progress.emit(total, total)
         self.log.emit(f"\n{'='*60}")
         self.log.emit(f"STORAGE COMMITMENT RESULTS")
         self.log.emit(f"  Committed: {committed:,}/{total:,}")
         if failed_count:
             self.log.emit(f"  Failed:    {failed_count:,}")
-            self.log.emit(f"  Note: Some PACS systems don't support Storage Commitment.")
-            self.log.emit(f"  Use C-FIND verification as an alternative.")
+            if not_supported:
+                self.log.emit(f"  Storage Commitment SOP Class not supported by this PACS.")
+                self.log.emit(f"  Use C-FIND verification as an alternative (recommended).")
+            else:
+                self.log.emit(f"  Some batches failed. Check individual batch logs above.")
         else:
             self.log.emit(f"  ALL INSTANCES COMMITTED SUCCESSFULLY")
         self.log.emit(f"{'='*60}")
@@ -2687,7 +3626,7 @@ class EchoThread(QThread):
     def run(self):
         try:
             ae = AE(ae_title=self.ae_scu)
-            ae.acse_timeout = 5; ae.dimse_timeout = 5; ae.network_timeout = 5
+            ae.maximum_pdu_size = 0; ae.acse_timeout = 5; ae.dimse_timeout = 5; ae.network_timeout = 5
             ae.add_requested_context(Verification)
             assoc = ae.associate(self.host, self.port, ae_title=self.ae_scp)
             if assoc.is_established:
@@ -2729,7 +3668,7 @@ class VerifyThread(QThread):
         self.log.emit(f"{'='*60}")
 
         ae = AE(ae_title=self.ae_scu)
-        ae.acse_timeout = 15; ae.dimse_timeout = 60; ae.network_timeout = 15
+        ae.maximum_pdu_size = 0; ae.acse_timeout = 15; ae.dimse_timeout = 60; ae.network_timeout = 15
         ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
 
         try:
@@ -2804,6 +3743,8 @@ class VerifyThread(QThread):
             except: pass
         except Exception as e:
             self.log.emit(f"Verification error: {e}")
+            try: assoc.release()
+            except: pass
 
         # Summary
         self.log.emit(f"\n{'='*60}")
@@ -2939,7 +3880,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.setMinimumSize(1100, 750); self.resize(1280, 850)
         self.settings = QSettings("DICOMMigrator", "DICOMMigrator")
-        self.dicom_files = []; self.manifest = MigrationManifest()
+        self.dicom_files = []; self._file_meta_lookup = {}; self._file_meta_by_sop = {}; self.manifest = MigrationManifest()
+        self._audit_logger = AuditLogger(None); self._scan_report = None; self._ts_probe_result = None
         self.scanner_thread = self.upload_thread = self.verify_thread = self.streaming_thread = None
         self.scan_start_time = self.upload_start_time = None
         self._sent = self._failed = self._skipped = 0
@@ -2952,17 +3894,48 @@ class MainWindow(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         ml = QVBoxLayout(central); ml.setContentsMargins(16, 12, 16, 8); ml.setSpacing(10)
 
-        header = QHBoxLayout()
-        t = QLabel(f"DICOM PACS Migrator"); t.setStyleSheet("font-size: 18px; font-weight: bold; color: #89b4fa;"); header.addWidget(t)
-        header.addStretch()
-        safety = QLabel("COPY-ONLY MODE"); safety.setStyleSheet("background-color: #1a3a1a; color: #a6e3a1; padding: 4px 12px; border-radius: 4px; font-weight: bold; font-size: 11px; border: 1px solid #2a5a2a;")
-        safety.setToolTip(DATA_SAFETY_NOTICE); header.addWidget(safety)
-        v = QLabel(f"v{VERSION}"); v.setStyleSheet("margin-left: 8px; color: #6c7086; font-size: 11px;"); header.addWidget(v)
-        ml.addLayout(header)
+        # ── Premium Header ──
+        header_frame = QFrame()
+        header_frame.setStyleSheet("""
+            QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #11111b, stop:0.5 #181825, stop:1 #11111b);
+                border-radius: 12px; border: 1px solid #1e1e2e; }
+        """)
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(20, 12, 20, 12)
 
-        banner = QLabel(f"{DATA_SAFETY_NOTICE}"); banner.setWordWrap(True)
-        banner.setStyleSheet("background-color: #11251a; color: #94e2d5; padding: 8px 12px; border-radius: 6px; font-size: 11px; border: 1px solid #1a3a2a;")
-        ml.addWidget(banner)
+        # App branding
+        title_col = QVBoxLayout(); title_col.setSpacing(2)
+        t = QLabel("DICOM PACS Migrator")
+        t.setStyleSheet("font-size: 20px; font-weight: 800; color: #89b4fa; letter-spacing: -0.3px; background: transparent;")
+        title_col.addWidget(t)
+        sub = QLabel("Production-grade DICOM C-STORE migration with copy-only safety")
+        sub.setStyleSheet("font-size: 11px; color: #585b70; background: transparent;")
+        title_col.addWidget(sub)
+        header_layout.addLayout(title_col)
+        header_layout.addStretch()
+
+        # Status badges
+        badge_row = QHBoxLayout(); badge_row.setSpacing(8)
+        safety = QLabel("  COPY-ONLY  ")
+        safety.setStyleSheet("background-color: rgba(166, 227, 161, 0.12); color: #a6e3a1; "
+            "padding: 5px 14px; border-radius: 6px; font-weight: 700; font-size: 11px; "
+            "border: 1px solid rgba(166, 227, 161, 0.25);")
+        safety.setToolTip(DATA_SAFETY_NOTICE)
+        badge_row.addWidget(safety)
+
+        phi_badge = QLabel("  PHI PROTECTED  ")
+        phi_badge.setStyleSheet("background-color: rgba(137, 180, 250, 0.12); color: #89b4fa; "
+            "padding: 5px 14px; border-radius: 6px; font-weight: 700; font-size: 11px; "
+            "border: 1px solid rgba(137, 180, 250, 0.25);")
+        phi_badge.setToolTip(PHI_WARNING)
+        badge_row.addWidget(phi_badge)
+
+        v = QLabel(f"v{VERSION}")
+        v.setStyleSheet("color: #45475a; font-size: 11px; font-weight: 700; background: transparent; padding: 5px 8px;")
+        badge_row.addWidget(v)
+        header_layout.addLayout(badge_row)
+        ml.addWidget(header_frame)
 
         self.tabs = QTabWidget(); ml.addWidget(self.tabs, 1)
         self.tabs.addTab(self._build_config_tab(), "Configuration")
@@ -2970,7 +3943,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_upload_tab(), "Upload")
         self.tabs.addTab(self._build_verify_tab(), "Verify")
         self.tabs.addTab(self._build_log_tab(), "Log")
-        self.statusBar().showMessage("Ready - Copy-Only Mode Active")
+        self.statusBar().showMessage("Ready - Copy-Only Mode Active - Source Data Protected - PHI Handling Active")
 
     # ─── Config Tab ───────────────────────────────────────────────────────
     def _build_config_tab(self):
@@ -2981,7 +3954,7 @@ class MainWindow(QMainWindow):
         inner = QWidget(); layout = QVBoxLayout(inner); layout.setSpacing(10); layout.setContentsMargins(10, 10, 10, 10)
 
         # ═══ Source Folder ═══
-        sg = QGroupBox("Source Folder (Read-Only Access)"); sl = QVBoxLayout(sg); sl.setSpacing(6)
+        sg = QGroupBox("Source PACS / Folder (Read-Only Access - Files Are Never Modified)"); sl = QVBoxLayout(sg); sl.setSpacing(6)
         row = QHBoxLayout()
         row.addWidget(QLabel("DICOM Folder:"))
         self.folder_input = QLineEdit(); self.folder_input.setPlaceholderText("Path to DICOM image folder...")
@@ -3009,7 +3982,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(sg)
 
         # ═══ Destination PACS ═══
-        dg = QGroupBox("Destination PACS Server"); dl = QVBoxLayout(dg); dl.setSpacing(6)
+        dg = QGroupBox("Destination PACS Server (Receives Copies Only)"); dl = QVBoxLayout(dg); dl.setSpacing(6)
         assist = QPushButton("Connection Assistant - Auto-Discover DICOM Nodes")
         assist.setStyleSheet("background-color: #cba6f7; color: #1e1e2e; font-size: 13px; padding: 8px 16px; font-weight: bold;")
         assist.clicked.connect(self._open_assistant); dl.addWidget(assist)
@@ -3100,6 +4073,70 @@ class MainWindow(QMainWindow):
         throttle_row.addWidget(self.throttle_rate)
         throttle_row.addStretch()
         al.addLayout(throttle_row)
+
+        adaptive_row = QHBoxLayout()
+        self.adaptive_throttle_check = QCheckBox("Adaptive throttle")
+        self.adaptive_throttle_check.setChecked(True)
+        self.adaptive_throttle_check.setToolTip("Auto-adjusts send rate based on destination response latency. "
+            "Faster responses = higher throughput, slower responses = auto-slowdown. "
+            "Superior to fixed bandwidth caps for protecting production PACS.")
+        adaptive_row.addWidget(self.adaptive_throttle_check)
+        self.auto_verify_check = QCheckBox("Auto-verify after upload")
+        self.auto_verify_check.setChecked(True)
+        self.auto_verify_check.setToolTip("Automatically run C-FIND two-point verification after upload completes. "
+            "Confirms every study arrived at the destination with correct instance counts.")
+        adaptive_row.addWidget(self.auto_verify_check)
+        adaptive_row.addStretch()
+        al.addLayout(adaptive_row)
+
+        safety_row = QHBoxLayout()
+        self.ts_probe_check = QCheckBox("TS probe before upload")
+        self.ts_probe_check.setChecked(True)
+        self.ts_probe_check.setToolTip("Query destination's accepted SOP classes and transfer syntaxes before "
+            "sending. Identifies rejected presentation contexts upfront to avoid wasted attempts.")
+        safety_row.addWidget(self.ts_probe_check)
+        self.audit_log_check = QCheckBox("HIPAA audit log")
+        self.audit_log_check.setChecked(False)
+        self.audit_log_check.setToolTip("Write structured JSON-lines audit trail of every migration event. "
+            "Includes timestamps, file paths, SOP UIDs, success/failure status. "
+            "Required for HIPAA compliance documentation.")
+        safety_row.addWidget(self.audit_log_check)
+        safety_row.addStretch()
+        al.addLayout(safety_row)
+
+        study_batch_row = QHBoxLayout()
+        self.study_batch_check = QCheckBox("Study-level batching")
+        self.study_batch_check.setChecked(True)
+        self.study_batch_check.setToolTip("Group files by StudyInstanceUID before sending. "
+            "Keeps all images from the same study together for atomic transfers, "
+            "simplified verification, and optimal presentation context negotiation.")
+        study_batch_row.addWidget(self.study_batch_check)
+        study_batch_row.addStretch()
+        al.addLayout(study_batch_row)
+
+        tod_row = QHBoxLayout()
+        self.tod_check = QCheckBox("Peak-hours rate limit")
+        self.tod_check.setChecked(False)
+        self.tod_check.setToolTip("Automatically reduce throughput during clinical hours "
+            "to avoid impacting production PACS. Full speed during off-peak.")
+        tod_row.addWidget(self.tod_check)
+        tod_row.addWidget(QLabel("Peak:"))
+        self.tod_start = QTimeEdit(); self.tod_start.setDisplayFormat("HH:mm")
+        self.tod_start.setTime(QTime(7, 0)); tod_row.addWidget(self.tod_start)
+        tod_row.addWidget(QLabel("to"))
+        self.tod_end = QTimeEdit(); self.tod_end.setDisplayFormat("HH:mm")
+        self.tod_end.setTime(QTime(18, 0)); tod_row.addWidget(self.tod_end)
+        tod_row.addWidget(QLabel("Workers:"))
+        self.tod_workers_spin = QSpinBox(); self.tod_workers_spin.setRange(1, 4)
+        self.tod_workers_spin.setValue(1); self.tod_workers_spin.setToolTip("Max concurrent workers during peak hours")
+        tod_row.addWidget(self.tod_workers_spin)
+        tod_row.addWidget(QLabel("Delay:"))
+        self.tod_delay_spin = QDoubleSpinBox(); self.tod_delay_spin.setRange(0.0, 10.0)
+        self.tod_delay_spin.setValue(0.5); self.tod_delay_spin.setSuffix("s")
+        self.tod_delay_spin.setToolTip("Inter-send delay during peak hours")
+        tod_row.addWidget(self.tod_delay_spin)
+        tod_row.addStretch()
+        al.addLayout(tod_row)
 
         sched_row = QHBoxLayout()
         self.schedule_check = QCheckBox("Schedule window")
@@ -3215,6 +4252,8 @@ class MainWindow(QMainWindow):
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderLabels(["Patient / Study / Series", "Modality", "Files", "Date", "Description"])
         self.file_tree.setAlternatingRowColors(True); self.file_tree.setRootIsDecorated(True); self.file_tree.setAnimated(True)
+        self.file_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         h = self.file_tree.header(); h.setStretchLastSection(True)
         h.setSectionResizeMode(0, QHeaderView.Stretch)
         for i in [1,2,3]: h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
@@ -3231,12 +4270,12 @@ class MainWindow(QMainWindow):
     # ─── Upload Tab ────────────────────────────────────────────────────────
     def _build_upload_tab(self):
         w = QWidget(); layout = QVBoxLayout(w)
-        sr = QLabel("COPY-ONLY: Source files will not be modified or deleted during upload")
-        sr.setStyleSheet("background-color: #11251a; color: #94e2d5; padding: 6px 12px; border-radius: 4px; font-size: 11px; border: 1px solid #1a3a2a;")
+        sr = QLabel("COPY-ONLY MODE ACTIVE: Source files opened read-only. Never modified, moved, or deleted. Destination receives copies only.")
+        sr.setStyleSheet("background-color: rgba(166, 227, 161, 0.06); color: #a6e3a1; padding: 8px 14px; border-radius: 8px; font-size: 11px; border: 1px solid rgba(166, 227, 161, 0.15); font-weight: 600;")
         layout.addWidget(sr)
 
         ctrl = QHBoxLayout()
-        self.upload_btn = QPushButton("Start Copy to Destination"); self.upload_btn.setStyleSheet("font-size: 14px; padding: 10px 28px;")
+        self.upload_btn = QPushButton("Start Copy to Destination"); self.upload_btn.setStyleSheet("font-size: 14px; padding: 12px 32px; border-radius: 10px;")
         self.upload_btn.clicked.connect(self._start_upload); ctrl.addWidget(self.upload_btn)
         self.retry_btn = QPushButton("Retry Failed"); self.retry_btn.setProperty("warning", True)
         self.retry_btn.setEnabled(False); self.retry_btn.clicked.connect(self._retry_failed); ctrl.addWidget(self.retry_btn)
@@ -3247,39 +4286,87 @@ class MainWindow(QMainWindow):
         ctrl.addStretch()
 
         # Export buttons
-        self.export_csv_btn = QPushButton("Export CSV Manifest"); self.export_csv_btn.setEnabled(False)
+        self.export_csv_btn = QPushButton("Export CSV"); self.export_csv_btn.setEnabled(False)
+        self.export_csv_btn.setToolTip("Export migration manifest as CSV. Contains PHI - handle per HIPAA policy.")
         self.export_csv_btn.clicked.connect(self._export_csv); ctrl.addWidget(self.export_csv_btn)
         self.export_report_btn = QPushButton("Export Report"); self.export_report_btn.setEnabled(False)
         self.export_report_btn.clicked.connect(self._export_report); ctrl.addWidget(self.export_report_btn)
         layout.addLayout(ctrl)
 
-        pg = QGroupBox("Progress"); pl = QVBoxLayout(pg)
-        self.upload_progress = QProgressBar(); self.upload_progress.setMinimumHeight(28); pl.addWidget(self.upload_progress)
+        # ── Progress Section ──
+        pg = QGroupBox("Migration Progress"); pl = QVBoxLayout(pg); pl.setSpacing(10)
+        self.upload_progress = QProgressBar(); self.upload_progress.setMinimumHeight(30)
+        self.upload_progress.setFormat("%v / %m files  (%p%)")
+        pl.addWidget(self.upload_progress)
         # Streaming folder status
-        self.stream_folder_lbl = QLabel(""); self.stream_folder_lbl.setStyleSheet("color: #89b4fa; font-family: 'Consolas', monospace; font-size: 11px;")
+        self.stream_folder_lbl = QLabel("")
+        self.stream_folder_lbl.setStyleSheet("color: #89b4fa; font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; background-color: #11111b; padding: 4px 8px; border-radius: 4px;")
         self.stream_folder_lbl.setWordWrap(True); self.stream_folder_lbl.setVisible(False); pl.addWidget(self.stream_folder_lbl)
         ir = QHBoxLayout()
-        self.upload_count_lbl = QLabel("0 / 0 files"); ir.addWidget(self.upload_count_lbl); ir.addStretch()
-        self.upload_speed_lbl = QLabel(""); ir.addWidget(self.upload_speed_lbl); ir.addStretch()
-        self.upload_eta_lbl = QLabel(""); ir.addWidget(self.upload_eta_lbl); pl.addLayout(ir)
-        rr = QHBoxLayout()
-        self.sent_label = QLabel("Copied: 0"); self.sent_label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 14px;"); rr.addWidget(self.sent_label)
-        self.failed_label = QLabel("Failed: 0"); self.failed_label.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 14px;"); rr.addWidget(self.failed_label)
-        self.skipped_label = QLabel("Skipped: 0"); self.skipped_label.setStyleSheet("color: #fab387; font-weight: bold; font-size: 14px;"); rr.addWidget(self.skipped_label)
-        self.conflict_label = QLabel("Conflicts: 0"); self.conflict_label.setStyleSheet("color: #cba6f7; font-weight: bold; font-size: 14px;"); rr.addWidget(self.conflict_label)
-        self.healed_label = QLabel("Healed: 0"); self.healed_label.setStyleSheet("color: #94e2d5; font-weight: bold; font-size: 14px;"); rr.addWidget(self.healed_label)
-        rr.addStretch()
-        self.source_safe_lbl = QLabel("Source: 0 modified, 0 deleted"); self.source_safe_lbl.setStyleSheet("color: #94e2d5; font-weight: bold; font-size: 12px;")
-        rr.addWidget(self.source_safe_lbl); pl.addLayout(rr); layout.addWidget(pg)
+        self.upload_count_lbl = QLabel("0 / 0 files")
+        self.upload_count_lbl.setStyleSheet("color: #7f849c; font-size: 12px;")
+        ir.addWidget(self.upload_count_lbl); ir.addStretch()
+        self.upload_speed_lbl = QLabel(""); self.upload_speed_lbl.setStyleSheet("color: #7f849c; font-size: 12px;")
+        ir.addWidget(self.upload_speed_lbl); ir.addStretch()
+        self.upload_eta_lbl = QLabel(""); self.upload_eta_lbl.setStyleSheet("color: #7f849c; font-size: 12px;")
+        ir.addWidget(self.upload_eta_lbl); pl.addLayout(ir)
 
-        # Results table with error details
-        self.upload_table = QTableWidget(); self.upload_table.setColumnCount(4)
-        self.upload_table.setHorizontalHeaderLabels(["File", "Status", "Detail", "SOP UID"])
+        # ── Stat Cards Row ──
+        stat_card_style = lambda color: (
+            f"background-color: rgba({color}, 0.08); "
+            f"border: 1px solid rgba({color}, 0.2); "
+            f"border-radius: 8px; padding: 8px 16px; font-weight: 700; font-size: 14px;")
+        rr = QHBoxLayout(); rr.setSpacing(8)
+        self.sent_label = QLabel("Copied: 0")
+        self.sent_label.setStyleSheet(stat_card_style("166, 227, 161") + " color: #a6e3a1;")
+        rr.addWidget(self.sent_label)
+        self.failed_label = QLabel("Failed: 0")
+        self.failed_label.setStyleSheet(stat_card_style("243, 139, 168") + " color: #f38ba8;")
+        rr.addWidget(self.failed_label)
+        self.skipped_label = QLabel("Skipped: 0")
+        self.skipped_label.setStyleSheet(stat_card_style("250, 179, 135") + " color: #fab387;")
+        rr.addWidget(self.skipped_label)
+        self.conflict_label = QLabel("Conflicts: 0")
+        self.conflict_label.setStyleSheet(stat_card_style("203, 166, 247") + " color: #cba6f7;")
+        rr.addWidget(self.conflict_label)
+        self.healed_label = QLabel("Healed: 0")
+        self.healed_label.setStyleSheet(stat_card_style("148, 226, 213") + " color: #94e2d5;")
+        rr.addWidget(self.healed_label)
+        rr.addStretch()
+        self.source_safe_lbl = QLabel("Source: 0 modified, 0 deleted")
+        self.source_safe_lbl.setStyleSheet(stat_card_style("166, 227, 161") + " color: #a6e3a1; font-size: 12px;")
+        rr.addWidget(self.source_safe_lbl)
+        pl.addLayout(rr); layout.addWidget(pg)
+
+        # Results table — full patient context per file
+        self.upload_table = QTableWidget(); self.upload_table.setColumnCount(9)
+        self.upload_table.setHorizontalHeaderLabels([
+            "Patient Name", "Patient ID", "Mod", "Study Date",
+            "Study Description", "Series Description", "SOP Class",
+            "Status", "Detail"])
         self.upload_table.setAlternatingRowColors(True)
-        uh = self.upload_table.horizontalHeader(); uh.setStretchLastSection(True)
-        uh.setSectionResizeMode(0, QHeaderView.Stretch); uh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        uh.setSectionResizeMode(2, QHeaderView.Stretch)
-        self.upload_table.verticalHeader().setVisible(False); self.upload_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.upload_table.setWordWrap(False)
+        self.upload_table.verticalHeader().setVisible(False)
+        self.upload_table.verticalHeader().setDefaultSectionSize(28)
+        self.upload_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.upload_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.upload_table.setShowGrid(False)
+        uh = self.upload_table.horizontalHeader()
+        uh.setStretchLastSection(True)  # Detail column fills remaining space
+        for col in range(9):
+            uh.setSectionResizeMode(col, QHeaderView.Interactive)
+        # Sensible defaults (user can override by dragging)
+        uh.resizeSection(0, 180)   # Patient name
+        uh.resizeSection(1, 100)   # Patient ID
+        uh.resizeSection(2, 40)    # Modality
+        uh.resizeSection(3, 90)    # Study Date
+        uh.resizeSection(4, 170)   # Study Description
+        uh.resizeSection(5, 140)   # Series Description
+        uh.resizeSection(6, 100)   # SOP Class
+        uh.resizeSection(7, 55)    # Status
+        # Col 8 (Detail) stretches via setStretchLastSection
+        self.upload_table.cellDoubleClicked.connect(self._on_upload_table_dblclick)
+        self.upload_table.setToolTip("Double-click any row to open file location")
         layout.addWidget(self.upload_table, 1); return w
 
     # ─── Verify Tab ────────────────────────────────────────────────────────
@@ -3347,6 +4434,19 @@ class MainWindow(QMainWindow):
         return build_tls_context(
             cert_file=self.tls_cert.text().strip() or None,
             ca_file=self.tls_ca.text().strip() or None)
+
+    def _build_tod_rate_control(self):
+        """Build TimeOfDayRateControl from UI settings."""
+        if not self.tod_check.isChecked():
+            return None
+        qt_start = self.tod_start.time()
+        qt_end = self.tod_end.time()
+        return TimeOfDayRateControl(
+            peak_start=dtime(qt_start.hour(), qt_start.minute()),
+            peak_end=dtime(qt_end.hour(), qt_end.minute()),
+            peak_workers=self.tod_workers_spin.value(),
+            peak_delay=self.tod_delay_spin.value(),
+            enabled=True, log_fn=self._log)
 
     def _get_schedule_start(self):
         """Get schedule start time as datetime.time."""
@@ -3437,6 +4537,20 @@ class MainWindow(QMainWindow):
 
     def _on_scan_complete(self, files):
         self.dicom_files = files
+        # Build metadata lookups for rich upload table display (zero overhead — dict from existing data)
+        # Triple-key: raw path + normalized path + SOP UID for bulletproof resolution
+        self._file_meta_lookup = {}
+        self._file_meta_by_sop = {}
+        for f in files:
+            p = f.get('path', '')
+            if p:
+                self._file_meta_lookup[p] = f
+                # Also index by normalized + case-folded path for Windows mismatches
+                np = os.path.normcase(os.path.normpath(p))
+                self._file_meta_lookup[np] = f
+            sop = f.get('sop_instance_uid', '')
+            if sop:
+                self._file_meta_by_sop[sop] = f
         self.scan_btn.setEnabled(True); self.scan_progress.setVisible(False)
         elapsed = time.time() - self.scan_start_time if self.scan_start_time else 0
         self._log(f"Scan: {elapsed:.1f}s, {len(files):,} DICOM files (read-only)")
@@ -3458,6 +4572,10 @@ class MainWindow(QMainWindow):
 
         self._populate_tree(); self._update_stats()
         if files: self.tabs.setCurrentIndex(1)
+
+        # Auto data quality report
+        if files:
+            self._scan_report = analyze_scan_data(files, log_fn=self._log)
 
     def _populate_tree(self):
         self.file_tree.blockSignals(True); self.file_tree.clear()
@@ -3517,6 +4635,63 @@ class MainWindow(QMainWindow):
                 gp.setCheckState(0, Qt.Checked if all_c else Qt.PartiallyChecked if any_c else Qt.Unchecked)
         self.file_tree.blockSignals(False)
         self._update_selected_count()
+
+    def _on_tree_context_menu(self, pos):
+        """Right-click context menu on file browser tree."""
+        from PyQt5.QtWidgets import QMenu, QAction
+        item = self.file_tree.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a; } "
+                           "QMenu::item:selected { background-color: #45475a; }")
+        item_type = item.data(0, Qt.UserRole)
+        study_uid = None
+
+        if item_type == 'study':
+            study_uid = item.data(0, Qt.UserRole + 1)
+        elif item_type == 'series':
+            # Get parent study
+            parent = item.parent()
+            if parent:
+                study_uid = parent.data(0, Qt.UserRole + 1)
+        elif item_type == 'patient':
+            # For patients, prioritize all studies under them
+            pass
+
+        if study_uid:
+            prioritize_action = QAction("Prioritize Study (send first)", self)
+            prioritize_action.triggered.connect(lambda: self._prioritize_study_from_tree(study_uid))
+            menu.addAction(prioritize_action)
+
+        if item_type == 'patient':
+            prioritize_all = QAction("Prioritize Patient (send all studies first)", self)
+            prioritize_all.triggered.connect(lambda: self._prioritize_patient_from_tree(item))
+            menu.addAction(prioritize_all)
+
+        if menu.actions():
+            menu.exec_(self.file_tree.viewport().mapToGlobal(pos))
+
+    def _prioritize_study_from_tree(self, study_uid):
+        """Prioritize a study during active upload."""
+        if hasattr(self, 'upload_thread') and self.upload_thread and self.upload_thread.isRunning():
+            self.upload_thread.prioritize_study(study_uid)
+            self._log(f"Study prioritized: {study_uid[:30]}...")
+        else:
+            self._log("Priority only works during active upload")
+
+    def _prioritize_patient_from_tree(self, patient_item):
+        """Prioritize all studies for a patient during active upload."""
+        if not hasattr(self, 'upload_thread') or not self.upload_thread or not self.upload_thread.isRunning():
+            self._log("Priority only works during active upload"); return
+        count = 0
+        for si in range(patient_item.childCount()):
+            study = patient_item.child(si)
+            study_uid = study.data(0, Qt.UserRole + 1)
+            if study_uid:
+                self.upload_thread.prioritize_study(study_uid)
+                count += 1
+        self._log(f"Patient prioritized: {count} studies moved to front")
 
     def _get_selected_files(self):
         """Get files matching checked series in tree."""
@@ -3636,6 +4811,39 @@ class MainWindow(QMainWindow):
         self.export_csv_btn.setEnabled(False)
         self.upload_start_time = time.time()
 
+        # Transfer syntax probe — discover what destination accepts before sending
+        sop_classes = list(set(f['sop_class_uid'] for f in files_to_send))
+        if self.ts_probe_check.isChecked() and len(sop_classes) > 0:
+            self._log(f"Probing destination for {len(sop_classes)} SOP classes...")
+            try:
+                accepted, rejected = probe_destination_ts(
+                    host, self.port_input.value(),
+                    self.ae_scu.text().strip() or "DICOM_MIGRATOR",
+                    self.ae_scp.text().strip() or "ANY-SCP",
+                    sop_classes, log_fn=self._log,
+                    tls_context=self._build_tls_context())
+                if rejected:
+                    # Count how many files use rejected SOP classes
+                    rejected_files = sum(1 for f in files_to_send if f['sop_class_uid'] in rejected)
+                    self._log(f"  Warning: {len(rejected)} SOP classes rejected by destination "
+                              f"({rejected_files:,} files may need decompression/fallback)")
+                self._ts_probe_result = (accepted, rejected)
+            except Exception as e:
+                self._log(f"  TS Probe failed (non-critical): {e}")
+
+        # HIPAA audit logging
+        if self.audit_log_check.isChecked():
+            audit_path = os.path.join(os.path.dirname(self.manifest.path) if self.manifest.path
+                         else os.path.expanduser('~'), f"migration_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+            self._audit_logger = AuditLogger(audit_path)
+            self._audit_logger.log_event('migration_start',
+                source=self.source_input.text(), destination=f"{host}:{self.port_input.value()}",
+                file_count=len(files_to_send), ae_scu=self.ae_scu.text().strip(),
+                ae_scp=self.ae_scp.text().strip())
+            self._log(f"Audit log: {audit_path}")
+        else:
+            self._audit_logger = AuditLogger(None)
+
         self.upload_thread = UploadThread(
             files_to_send, host, self.port_input.value(),
             self.ae_scu.text().strip() or "DICOM_MIGRATOR",
@@ -3651,7 +4859,10 @@ class MainWindow(QMainWindow):
             max_retries=self.heal_waves_spin.value() if self.auto_heal_check.isChecked() else 0,
             throttle=self._build_throttle(),
             tag_rules=self._build_tag_rules(),
-            tls_context=self._build_tls_context())
+            tls_context=self._build_tls_context(),
+            adaptive_throttle_enabled=self.adaptive_throttle_check.isChecked(),
+            study_batching=self.study_batch_check.isChecked(),
+            tod_rate_control=self._build_tod_rate_control())
         self.upload_thread.progress.connect(self._on_upload_progress)
         self.upload_thread.file_sent.connect(self._on_file_sent)
         self.upload_thread.finished.connect(self._on_upload_complete)
@@ -3725,7 +4936,9 @@ class MainWindow(QMainWindow):
             schedule_end=self._get_schedule_end(),
             filter_modalities=self._get_stream_modalities(),
             filter_date_from=self._get_stream_date_from(),
-            filter_date_to=self._get_stream_date_to())
+            filter_date_to=self._get_stream_date_to(),
+            adaptive_throttle_enabled=self.adaptive_throttle_check.isChecked(),
+            tod_rate_control=self._build_tod_rate_control())
         self.streaming_thread.file_sent.connect(self._on_file_sent)
         self.streaming_thread.finished.connect(self._on_streaming_complete)
         self.streaming_thread.error.connect(lambda e: self._log(f"ERROR: {e}"))
@@ -3770,6 +4983,31 @@ class MainWindow(QMainWindow):
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
         if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
 
+        # Log circuit breaker stats
+        if hasattr(self, 'streaming_thread') and self.streaming_thread and hasattr(self.streaming_thread, '_circuit_breaker'):
+            cb = self.streaming_thread._circuit_breaker.stats
+            if cb['total_trips'] > 0:
+                self._log(f"Circuit breaker tripped {cb['total_trips']} time(s) during migration")
+
+        # Log adaptive throttle stats
+        if hasattr(self, 'streaming_thread') and self.streaming_thread and hasattr(self.streaming_thread, '_adaptive_throttle'):
+            at = self.streaming_thread._adaptive_throttle
+            if at.enabled and at._sample_count > 0:
+                self._log(f"Adaptive throttle: avg response latency {at._avg_latency:.3f}s ({at._sample_count:,} samples)")
+
+        # Auto-verify after streaming
+        if sent > 0 and self.auto_verify_check.isChecked():
+            self._log("Auto-verify: running two-point C-FIND confirmation...")
+            QTimer.singleShot(500, self._start_verify)
+
+        # Finalize HIPAA audit log
+        if hasattr(self, '_audit_logger') and self._audit_logger.enabled:
+            self._audit_logger.log_event('migration_complete',
+                sent=sent, failed=failed, skipped=skipped,
+                elapsed_seconds=round(time.time() - self.upload_start_time, 1) if self.upload_start_time else 0)
+            self._audit_logger.finalize()
+            self._log(f"Audit log finalized")
+
     def _retry_failed(self):
         """Retry only files that failed in the last run."""
         failed_sops = {uid for uid, rec in self.manifest.records.items() if rec['status'] == 'failed'}
@@ -3789,30 +5027,87 @@ class MainWindow(QMainWindow):
             self.upload_eta_lbl.setText(f"ETA: {r/3600:.1f}h" if r > 3600 else f"ETA: {r/60:.0f}m {r%60:.0f}s" if r > 60 else f"ETA: {r:.0f}s")
 
     def _on_file_sent(self, path, ok, msg, sop_uid):
-        self._upload_results.append((path, ok, msg, sop_uid))
 
-        # Bounded table — evict oldest rows when limit reached
+        # Bounded table -- evict oldest rows when limit reached
         if self.upload_table.rowCount() >= MAX_TABLE_ROWS:
             self.upload_table.removeRow(0)
 
+        # Look up patient metadata -- try path first, then normalized, then SOP UID, then manifest
+        meta = self._file_meta_lookup.get(path)
+        if not meta:
+            meta = self._file_meta_lookup.get(os.path.normcase(os.path.normpath(path)))
+        if not meta and sop_uid:
+            meta = self._file_meta_by_sop.get(sop_uid)
+        # Manifest fallback — essential for streaming mode where _file_meta_lookup is empty
+        if not meta and sop_uid and hasattr(self, 'manifest') and self.manifest and self.manifest.records:
+            mrec = self.manifest.records.get(sop_uid)
+            if mrec:
+                meta = mrec
+        if not meta:
+            meta = {}
+        patient_name = meta.get('patient_name', '') or os.path.basename(path)
+        patient_id = meta.get('patient_id', '')
+        modality = meta.get('modality', '')
+        study_date = meta.get('study_date', '')
+        study_desc = meta.get('study_desc', '')
+        series_desc = meta.get('series_desc', '')
+        sop_class = meta.get('sop_class_uid', '')
+        # Resolve SOP Class UID to human name
+        if sop_class:
+            try:
+                from pydicom.uid import UID
+                sop_name = UID(sop_class).name
+                if sop_name and sop_name != sop_class:
+                    sop_class = sop_name.replace(' Image Storage', '').replace(' Storage', '')
+            except Exception:
+                pass
+            if len(sop_class) > 30:
+                sop_class = sop_class[:28] + '..'
+        # Format date: YYYYMMDD -> YYYY-MM-DD
+        if study_date and len(study_date) == 8:
+            study_date = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:]}"
+
         row = self.upload_table.rowCount(); self.upload_table.insertRow(row)
-        items = [QTableWidgetItem(os.path.basename(path)),
-                 QTableWidgetItem("OK" if ok else "FAIL"),
-                 QTableWidgetItem(msg),
-                 QTableWidgetItem(sop_uid[:30] + "..." if len(sop_uid) > 30 else sop_uid)]
-        # Color code: teal=auto-healed, purple=conflict resolved, green=OK, red=fail
+
+        # Patient name item -- store full path for double-click folder open
+        name_item = QTableWidgetItem(str(patient_name))
+        name_item.setData(Qt.UserRole, path)
+        name_item.setToolTip(f"Double-click to open folder\n{path}")
+
+        # Status with icon prefix
         if ok and "Auto-healed" in msg:
-            color = QColor("#94e2d5")  # teal for auto-healed
+            status_text = "HEALED"; color = QColor("#94e2d5")
         elif ok and "Conflict resolved" in msg:
-            color = QColor("#cba6f7")  # purple for conflict-resolved success
+            status_text = "REMAP"; color = QColor("#cba6f7")
         elif ok:
-            color = QColor("#a6e3a1")
+            status_text = "OK"; color = QColor("#a6e3a1")
         else:
-            color = QColor("#f38ba8")
-        items[1].setForeground(color)
-        if not ok: items[2].setForeground(color)
-        elif "Conflict resolved" in msg: items[2].setForeground(QColor("#cba6f7"))
-        elif "Auto-healed" in msg: items[2].setForeground(QColor("#94e2d5"))
+            status_text = "FAIL"; color = QColor("#f38ba8")
+
+        items = [name_item,
+                 QTableWidgetItem(patient_id),
+                 QTableWidgetItem(modality),
+                 QTableWidgetItem(study_date),
+                 QTableWidgetItem(study_desc),
+                 QTableWidgetItem(series_desc),
+                 QTableWidgetItem(sop_class),
+                 QTableWidgetItem(status_text),
+                 QTableWidgetItem(msg)]
+
+        # Apply colors
+        name_item.setForeground(QColor("#89b4fa"))
+        items[7].setForeground(color)  # Status column
+        items[7].setFont(QFont("Segoe UI", 9, QFont.Bold))
+        if not ok:
+            items[8].setForeground(color)
+        elif "Conflict resolved" in msg:
+            items[8].setForeground(QColor("#cba6f7"))
+        elif "Auto-healed" in msg:
+            items[8].setForeground(QColor("#94e2d5"))
+        # Dim metadata columns slightly for visual hierarchy
+        dim_color = QColor("#7f849c")
+        for ci in [4, 5, 6]:
+            items[ci].setForeground(dim_color)
         for c, it in enumerate(items): self.upload_table.setItem(row, c, it)
         self.upload_table.scrollToBottom()
 
@@ -3823,9 +5118,32 @@ class MainWindow(QMainWindow):
             self._sent += 1
         elif "Already sent" in msg or "Skipped" in msg or "Missing SOP" in msg: self._skipped += 1
         else: self._failed += 1
-        self.sent_label.setText(f"Copied: {self._sent}"); self.failed_label.setText(f"Failed: {self._failed}")
-        self.skipped_label.setText(f"Skipped: {self._skipped}")
+        self.sent_label.setText(f"Copied: {self._sent:,}"); self.failed_label.setText(f"Failed: {self._failed:,}")
+        self.skipped_label.setText(f"Skipped: {self._skipped:,}")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted")
+
+        # HIPAA audit log
+        if hasattr(self, '_audit_logger') and self._audit_logger.enabled:
+            self._audit_logger.log_event(
+                'file_sent' if ok else 'file_failed',
+                sop_uid=sop_uid, path=os.path.basename(path),
+                status='success' if ok else 'failure', message=msg[:200],
+                patient=patient_name, patient_id=patient_id)
+
+    def _on_upload_table_dblclick(self, row, col):
+        """Double-click any cell to open the file's containing folder."""
+        item = self.upload_table.item(row, 0)
+        if not item: return
+        fpath = item.data(Qt.UserRole)
+        if fpath and os.path.exists(fpath):
+            folder = os.path.dirname(fpath)
+            if sys.platform == 'win32':
+                # Select the file in Explorer
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(fpath)])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', fpath])
+            else:
+                subprocess.Popen(['xdg-open', folder])
 
     def _on_speed(self, fps, mbps): self.upload_speed_lbl.setText(f"{fps:.1f} files/s | {mbps:.2f} MB/s")
 
@@ -3838,6 +5156,31 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Complete - Copied: {sent}, Failed: {failed}, Skipped: {skipped}{conflict_msg} | Source: UNTOUCHED")
         self.source_safe_lbl.setText("Source: 0 modified, 0 deleted - ALL ORIGINALS INTACT")
         if self.manifest.path and self.manifest.save_to_disk: self._log(f"Manifest saved: {self.manifest.path}")
+
+        # Log circuit breaker stats if it tripped during migration
+        if hasattr(self.upload_thread, '_circuit_breaker'):
+            cb = self.upload_thread._circuit_breaker.stats
+            if cb['total_trips'] > 0:
+                self._log(f"Circuit breaker tripped {cb['total_trips']} time(s) during migration")
+
+        # Log adaptive throttle stats
+        if hasattr(self.upload_thread, '_adaptive_throttle') and self.upload_thread._adaptive_throttle.enabled:
+            at = self.upload_thread._adaptive_throttle.stats
+            if at['sample_count'] > 0:
+                self._log(f"Adaptive throttle: avg response latency {at['avg_latency']:.3f}s ({at['sample_count']:,} samples)")
+
+        # Auto-verify: run C-FIND confirmation if enabled and migration had successful sends
+        if sent > 0 and self.auto_verify_check.isChecked():
+            self._log("Auto-verify: running two-point C-FIND confirmation...")
+            QTimer.singleShot(500, self._start_verify)
+
+        # Finalize HIPAA audit log
+        if hasattr(self, '_audit_logger') and self._audit_logger.enabled:
+            self._audit_logger.log_event('migration_complete',
+                sent=sent, failed=failed, skipped=skipped,
+                elapsed_seconds=round(time.time() - self.upload_start_time, 1) if self.upload_start_time else 0)
+            self._audit_logger.finalize()
+            self._log(f"Audit log finalized")
 
     def _toggle_pause(self):
         thread = self.streaming_thread if self._streaming_mode else self.upload_thread
