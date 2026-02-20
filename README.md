@@ -1,14 +1,18 @@
 # DICOM PACS Migrator
 
-![Version](https://img.shields.io/badge/version-1.0.2-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+![DICOM](https://img.shields.io/badge/DICOM-C--STORE%20%7C%20C--FIND%20%7C%20C--ECHO-0078D4)
 ![Status](https://img.shields.io/badge/status-production--ready-success)
+![HIPAA](https://img.shields.io/badge/HIPAA-audit--logging-critical)
 
-> Production-grade DICOM filesystem-to-PACS migration tool with parallel workers, self-healing retry, bandwidth throttling, tag morphing, scheduling, TLS encryption, and post-migration verification. Copy-only architecture — source data is **NEVER** modified or deleted.
+> Production-grade DICOM C-STORE migration tool with a dark-themed GUI, parallel workers, self-healing retries, HIPAA audit logging, and a **copy-only architecture** that never modifies or deletes source data.
 
 ![Screenshot](screenshot.png)
+
+---
 
 ## Quick Start
 
@@ -18,203 +22,363 @@ cd dicom-pacs-migrator
 python dicom_migrator.py  # Auto-installs all dependencies on first run
 ```
 
-**Requirements:** Python 3.8+. All dependencies (`pydicom`, `pynetdicom`, `PyQt5`, `Pillow`, `pylibjpeg`) are auto-installed on first launch.
+No virtual environment, no pip install, no manual setup. The script bootstraps itself.
 
-Or install manually first:
+### Requirements
 
-```bash
-pip install -r requirements.txt
-python dicom_migrator.py
-```
+- Python 3.8+
+- OS: Windows 10/11, Linux, macOS
+- Network access to source DICOM files and destination PACS
 
-## Build Standalone Executable
+Auto-installed dependencies: `PyQt5`, `pydicom`, `pynetdicom`, `numpy`, `Pillow`, `pylibjpeg`, `pylibjpeg-openjpeg`, `pylibjpeg-libjpeg`
 
-```bash
-pip install pyinstaller
-pyinstaller dicom_migrator.spec
-```
+---
 
-The compiled exe lands in `dist/DICOM_PACS_Migrator.exe` — single file, no Python required on the target machine. The bootstrap auto-installer is automatically skipped in frozen executables.
+## What It Does
 
-## Why This Tool
+Copies DICOM images from a local folder (or legacy PACS export) to a destination PACS server via standard DICOM C-STORE. Handles the real-world problems that simple C-STORE scripts can't — compressed syntax rejection, patient ID conflicts, dead associations, PACS backpressure, and transfers measured in hundreds of thousands of files across clinical hours.
 
-Migrating DICOM data between PACS systems is a common but painful task in healthcare IT. Existing open-source tools are either command-line only, single-threaded, or require complex Docker/Java setups. Commercial tools cost thousands and lock you into vendor ecosystems.
+### What It Does NOT Do
 
-This tool delivers enterprise-grade migration capabilities in a single Python file with a professional GUI — no Java, no Docker, no license keys.
+- **Never modifies source files** — files are opened read-only, never renamed, moved, or deleted
+- **Never deletes from the destination** — sends copies only, no C-MOVE or C-GET
+- **Not a PACS viewer** — no image rendering, no diagnostic display
+- **Not a PACS server** — does not accept incoming associations or store data locally
+
+---
 
 ## Features
 
+### Core Migration
+
 | Feature | Description | Default |
 |---------|-------------|---------|
-| **Parallel Workers** | 1-16 concurrent persistent DICOM associations | 4 workers |
-| **Self-Healing Retry** | Exponential backoff auto-retry waves for transient failures | 3 waves |
-| **Fast Resume** | Directory-level manifest skip (200-400x faster than file-level) | Enabled |
-| **Streaming Mode** | Walk + read + send per-directory, no pre-scan needed | Available |
-| **Targeted Association Fallback** | Auto-negotiates dedicated association for SOP classes rejected by batch negotiation | Always on |
-| **Bandwidth Throttle** | Token bucket rate limiter to protect production PACS | Disabled |
-| **Migration Schedule** | Time-window auto-pause (e.g., migrate only 7PM-6AM) | Disabled |
-| **Tag Morphing** | In-memory DICOM tag transforms (prefix, suffix, set, delete, strip_private) | Disabled |
-| **TLS Encryption** | Encrypted DICOM associations for WAN/HIPAA-sensitive migrations | Disabled |
-| **Post-Migration Verify** | C-FIND audit of destination with instance + series count matching | Available |
-| **Storage Commitment** | Formal N-ACTION/N-EVENT-REPORT storage commitment verification | Available |
-| **Modality/Date Filtering** | Staged migration by modality (CR/DX first) or date range | Disabled |
-| **Patient ID Resolution** | Auto-resolve 0xFFFB conflicts via C-FIND + demographics remap | Enabled |
-| **Pre-Flight Skip** | Query destination to skip studies already present | Enabled |
-| **Decompress Fallback** | Auto-decompress JPEG/JPEG2000/RLE if destination rejects compressed syntax | Enabled |
-| **Network Discovery** | Auto-scan subnet for DICOM nodes with C-ECHO probing | Available |
-| **CSV/Report Export** | Manifest, verification, and summary report exports | Available |
-| **Crash Recovery** | Atomic JSON manifest with resume from any interruption | Enabled |
-| **DICOM Validation** | Rejects non-conformant files before sending | Always on |
-| **High-DPI Aware** | Scales correctly on 4K/HiDPI displays | Always on |
+| Parallel Workers | 1–16 concurrent C-STORE associations | 4 workers |
+| Streaming Mode | Walk + read + send per-directory without pre-scanning the entire folder tree | Button |
+| Resume / Crash Recovery | JSON manifest tracks every file — restart exactly where you left off | Enabled |
+| Study-Level Batching | Groups files by StudyInstanceUID for atomic study transfers | Enabled |
+| Priority Queue | Right-click any study or patient during upload to move it to the front of the queue | Context menu |
+| Pre-flight Duplicate Skip | C-FIND the destination before sending to skip studies that already exist | Checkbox |
+
+### Error Recovery
+
+| Feature | Description | Trigger |
+|---------|-------------|---------|
+| Decompress Fallback | In-memory decompression when destination rejects compressed transfer syntax | Automatic |
+| Targeted Association | Builds a fresh AE with only the rejected SOP class and retries | Automatic |
+| Patient ID Conflict (0xFFFB) | C-FIND destination for correct demographics, remap in-memory, resend | Automatic |
+| 0xC000 "Cannot Understand" | 3-step recovery: strip private tags, decompress, targeted uncompressed association | Automatic |
+| 0xA700 "Out of Resources" | Exponential backoff retry (2s, 4s, 8s) for PACS backpressure | Automatic |
+| 0xA900 SOP Class Fallback | Reclassifies rejected files as Secondary Capture to salvage study data | Automatic |
+| Dead Association Detection | Detects dropped associations and re-establishes before the next file | Automatic |
+| Circuit Breaker | Trips after 5 consecutive failures, waits 60s, probes with single file before resuming | Automatic |
+| Auto-Retry Waves | Re-sends transient failures in up to 5 waves with exponential backoff (30s to 300s) | Configurable |
+
+### Throughput Control
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| Unlimited PDU | Negotiates maximum PDU size on all association paths | 0 (Unlimited) |
+| Bandwidth Throttle | Hard cap in MB/s to avoid saturating clinical links | Off |
+| Adaptive Latency Throttle | Automatically backs off when PACS response time exceeds 1s | Checkbox |
+| Time-of-Day Rate Control | Reduce workers and add inter-file delay during clinical hours (configurable peak window) | Off |
+| Migration Schedule | Only run between configured start/end times — pauses outside the window | Off |
+
+### Verification & Compliance
+
+| Feature | Description |
+|---------|-------------|
+| Post-Migration C-FIND Audit | Queries destination for every study and compares instance counts |
+| Auto-Verify | Triggers C-FIND verification immediately after upload completes |
+| Storage Commitment (N-ACTION) | Formal DICOM Storage Commitment in batches of 500 instances |
+| Transfer Syntax Probe | Pre-flight probe to discover what the destination actually accepts |
+| Data Quality Report | Pre-migration analysis: missing tags, unsupported SOP classes, encoding issues |
+| HIPAA Audit Logging | JSON-lines structured log of every file sent/failed with patient identifiers |
+| CSV / Report Export | Export manifest, verification results, and full migration report |
+
+### Data Protection
+
+| Feature | Description |
+|---------|-------------|
+| Copy-Only Architecture | Source files opened read-only — never modified, moved, or deleted |
+| TLS 1.2+ Encryption | Optional TLS for DICOM associations with certificate and CA support |
+| PHI-Aware Logging | All exports and logs carry PHI warnings — handle per HIPAA policy |
+| In-Memory Only Modifications | Decompression, tag morphing, and patient ID remapping happen in-memory only |
+
+### Network & Configuration
+
+| Feature | Description |
+|---------|-------------|
+| Connection Assistant | Subnet scanner with TCP port probe + C-ECHO verification — auto-populates settings |
+| Tag Morphing | Modify DICOM tags in-memory during transfer (set, prefix, suffix, delete, strip_private) |
+| Modality / Date Filtering | Only send specific modalities (CR, DX, MR, CT...) or date ranges |
+| TLS Client Certificates | Load cert chain + CA for mutual TLS authentication |
+| Settings Persistence | All configuration saved and restored between sessions |
+
+---
 
 ## How It Works
 
 ```
-┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────┐
-│  Source Folder   │────>│  Migration Engine    │────>│ Destination PACS │
-│  (Read-Only)     │     │                     │     │                 │
-│                  │     │  Tag Morphing        │     │  C-STORE SCP    │
-│  DICOM files     │     │  Decompression       │     │                 │
-│  never modified  │     │  Conflict Resolution │     │  Studies arrive │
-│  never deleted   │     │  Bandwidth Throttle  │     │  verified via   │
-│                  │     │  Schedule Window     │     │  C-FIND audit   │
-└─────────────────┘     │  Parallel Workers    │     └─────────────────┘
-                        │  Self-Healing Retry  │
-                        └─────────────────────┘
-
-Resume Manifest (JSON):
-  - Tracks every file: sent/failed/skipped
-  - Directory-level fast-skip on resume
-  - Atomic writes prevent corruption
+┌──────────────────────┐     ┌─────────────────────────┐     ┌──────────────────────┐
+│   SOURCE FOLDER      │     │   DICOM PACS MIGRATOR    │     │   DESTINATION PACS   │
+│   (Read-Only)        │     │                         │     │   (Receives Copies)  │
+│                      │     │  ┌───────────────────┐  │     │                      │
+│  DICOM files on      │────>│  │  Scanner Thread   │  │     │                      │
+│  disk / NAS / USB    │ RO  │  │  (header parse)   │  │     │                      │
+│                      │     │  └────────┬──────────┘  │     │                      │
+│  NEVER modified      │     │           │             │     │                      │
+│  NEVER deleted       │     │  ┌────────v──────────┐  │     │                      │
+│                      │     │  │  Study Batcher    │  │     │                      │
+└──────────────────────┘     │  │  + Priority Queue │  │     │                      │
+                             │  └────────┬──────────┘  │     │                      │
+                             │           │             │     │                      │
+                             │  ┌────────v──────────┐  │     │                      │
+                             │  │  Worker Pool      │  │     │                      │
+                             │  │  (1-16 parallel)  │─────>  │  Stores copies       │
+                             │  │                   │C-STORE │                      │
+                             │  │  Circuit Breaker  │  │     │                      │
+                             │  │  Adaptive Throttle│  │     │                      │
+                             │  │  ToD Rate Control │  │     │                      │
+                             │  └────────┬──────────┘  │     │                      │
+                             │           │             │     │                      │
+                             │  ┌────────v──────────┐  │     │                      │
+                             │  │  Verify (C-FIND)  │─────>  │  Confirms counts     │
+                             │  │  Storage Commit   │  │     │                      │
+                             │  └───────────────────┘  │     │                      │
+                             │                         │     │                      │
+                             │  Manifest | Audit Log   │     │                      │
+                             └─────────────────────────┘     └──────────────────────┘
 ```
 
-### Targeted Association Fallback
+### Error Recovery Flow
 
-DICOM associations can negotiate at most 128 presentation contexts. When a batch contains many SOP classes, less common ones (Ultrasound, Structured Reports, Key Object Selection) can get squeezed out of the negotiation, causing `No presentation context` failures.
+```
+C-STORE attempt
+  │
+  ├─ 0x0000 Success ────────────────────────> Done
+  ├─ 0xB000 Warning ────────────────────────> Done (stored with coercion)
+  │
+  ├─ Presentation Context Rejected ──┐
+  │   1. Decompress in-memory        │
+  │   2. Retry on existing assoc     │
+  │   3. Targeted assoc (SOP-only)   │
+  │   4. Uncompressed-only assoc     │
+  │                                  │
+  ├─ 0xFFFB Patient ID Conflict ──┐  │
+  │   1. C-FIND destination       │  │
+  │   2. Remap demographics       │  │
+  │   3. Suffix fallback          │  │
+  │                               │  │
+  ├─ 0xC000 Cannot Understand ──┐ │  │
+  │   1. Strip private tags     │ │  │
+  │   2. Decompress + clean     │ │  │
+  │   3. Targeted uncompressed  │ │  │
+  │                             │ │  │
+  ├─ 0xA700 Out of Resources    │ │  │
+  │   Backoff: 2s, 4s, 8s      │ │  │
+  │                             │ │  │
+  ├─ 0xA900 SOP Mismatch       │ │  │
+  │   Secondary Capture retry   │ │  │
+  │                             │ │  │
+  └─ Association Dead           │ │  │
+      Re-establish + retry      │ │  │
+                                v v  v
+      All fail ─────────────────────────> Queued for auto-retry wave
+```
 
-When this happens, the migrator automatically builds a fresh association containing *only* the rejected SOP class with every available transfer syntax. This gives it all 128 slots to negotiate a compatible syntax with the destination. After the file sends successfully, the broad association is re-established for the remaining batch. This happens transparently — you'll see `Sent via targeted assoc` in the log.
+---
 
 ## Usage
 
-### Basic Migration (Scan + Upload)
+### Tab Workflow
 
-1. **Set source folder** — point to your DICOM image directory
-2. **Configure destination** — enter PACS IP, port, AE titles (or use Connection Assistant)
-3. **Scan** — enumerate and inspect all DICOM files
-4. **Filter** — select patients, modalities, date ranges in the File Browser
-5. **Upload** — start copy to destination with real-time progress
+1. **Configuration** — Set source folder, destination PACS host/port/AE titles, and toggle features
+2. **File Browser** — Scan source folder, review patient/study/series tree, check/uncheck what to send
+3. **Upload** — Start migration, monitor per-file progress with full patient metadata in a 9-column table
+4. **Verify** — Post-migration C-FIND audit to confirm everything arrived
+5. **Log** — Full operational log, exportable
 
-### Streaming Migration (Large Stores)
+### Streaming Mode (Large Migrations)
 
-For multi-terabyte stores, use **Stream Migrate Entire Store** — walks, reads, and sends per-directory with no pre-scan. Starts sending immediately.
+For migrations with 100K+ files where a full pre-scan would take too long:
 
-### Post-Migration Verification
+1. Set source folder and destination in Configuration
+2. Click **Stream Migrate** — the tool walks directories one at a time, scanning and sending per-folder
+3. Resume manifest ensures crash recovery even mid-directory
 
-After migration completes, switch to the **Verify** tab and click **Verify Migration**. The tool queries the destination PACS via C-FIND for every study in the manifest, comparing instance counts and series counts. Mismatches are flagged for re-migration.
+### Tag Morphing
 
-## Configuration
-
-### Bandwidth Throttle
-
-Protect production PACS from migration overload:
-
-| Setting | Recommendation |
-|---------|---------------|
-| 0 MB/s | Unlimited (dedicated migration window) |
-| 10 MB/s | Conservative (shared clinical network) |
-| 50 MB/s | Moderate (off-hours with some clinical load) |
-| 100+ MB/s | Fast dedicated link |
-
-### Migration Schedule
-
-Set a time window for migration. The tool automatically pauses outside the window and resumes when it opens. Supports overnight windows (e.g., 19:00 to 06:00).
-
-### Tag Morphing Rules
-
-Apply DICOM tag transforms during migration. Source files are **never** modified — all transforms are in-memory only.
+Modify DICOM tags in-memory during transfer. Source files are never changed.
 
 ```
-# One rule per line. Format: KEYWORD ACTION [VALUE]
 InstitutionName set "New Hospital"
-PatientID prefix MIG_
-AccessionNumber suffix _2026
-ReferringPhysicianName delete
-strip_private
+ReferringPhysicianName set "DR^SMITH"
+InstitutionAddress delete
+PatientID prefix "MIG_"
 ```
 
-**Actions:** `set` (overwrite), `prefix` (prepend), `suffix` (append), `delete` (remove tag), `strip_private` (remove all private tags)
+### Priority Queue
 
-### Storage Commitment
+During an active upload, right-click any study or patient in the File Browser tab:
 
-For the highest level of assurance, use **Storage Commitment** from the Verify tab. This sends a formal DICOM N-ACTION request asking the destination PACS to confirm it has committed to permanently storing the migrated instances. Not all PACS support this — if your PACS doesn't, C-FIND verification provides equivalent confidence.
+- **Prioritize Study** — all unsent files from that study jump to the front
+- **Prioritize Patient** — all studies for that patient jump to the front
 
-### TLS Encryption
+### Time-of-Day Rate Control
 
-For WAN migrations or HIPAA-sensitive environments, enable TLS encryption. Supports anonymous TLS (no client cert) or mutual TLS with CA/client certificates.
+Reduce throughput during clinical hours to avoid impacting production PACS:
 
-## Safety Guarantees
+- Peak window: configurable (default 07:00 to 18:00)
+- Peak workers: 1 to 4 (default 1)
+- Peak delay: 0.0 to 10.0s between files (default 0.5s)
+- Full speed resumes automatically during off-peak
 
-- **Source files are NEVER modified, moved, or deleted** — enforced at the architecture level
-- **Read-only file access** — source files opened with `pydicom.dcmread()` only
-- **In-memory transforms** — tag morphing, decompression, and conflict resolution modify only in-memory copies
-- **No destructive operations** — zero `dcmwrite`, zero `os.remove`, zero `shutil.move` in the entire codebase
-- **Atomic manifest writes** — crash at any point, resume without data loss
-- **Destination-safe** — existing studies on the destination are detected and skipped, not overwritten
+---
 
-## Known Limitations
+## Upload Table Columns
 
-- **Single-file architecture** — everything is in one `.py` file. This is intentional for easy deployment but means the codebase is large (~3,900 lines).
-- **Log output memory** — the GUI log pane accumulates text during long migrations. Use the "Clear Log" button periodically on very large runs, or export to file.
-- **Manifest memory** — the JSON manifest is held in memory. At 1M+ files (~500MB RAM), this can be significant. Typical chiropractic/radiology PACS migrations (< 100K studies) are well within bounds.
-- **Storage Commitment** — many PACS vendors don't implement the Storage Commitment Push Model. Falls back gracefully to C-FIND verification.
-- **DICOMDIR** — the tool reads individual DICOM files from the filesystem, not DICOMDIR index files. Point it at the folder containing the actual `.dcm` files.
-- **C-MOVE** — this is a C-STORE push tool. It does not support pulling via C-MOVE from a source PACS. You need filesystem access to the source data.
+The Upload tab shows full patient context for every file transferred:
 
-## Comparison with Other Tools
+| Column | Content |
+|--------|---------|
+| Patient Name | Blue clickable text — double-click to open file location in Explorer/Finder |
+| Patient ID | DICOM PatientID |
+| Mod | Modality (CR, DX, CT, MR, US, etc.) |
+| Study Date | Formatted YYYY-MM-DD |
+| Study Description | Study-level description from DICOM header |
+| Series Description | Series-level description from DICOM header |
+| SOP Class | Human-readable name (e.g. "Digital X-Ray", not the raw UID) |
+| Status | Color-coded: **OK** (green) / **FAIL** (red) / **HEALED** (teal) / **REMAP** (purple) |
+| Detail | Error messages, resolution methods, or transfer info |
 
-| Capability | This Tool | Orthanc | dcm4che storescu | Commercial |
-|-----------|-----------|---------|------------------|------------|
-| GUI | Full PyQt5 | Web UI | CLI only | Varies |
-| Parallel workers | 1-16 concurrent | Single-threaded | Single | Varies |
-| Self-healing retry | Exponential backoff waves | Manual | Manual | Varies |
-| Fast resume | Directory-level skip | None | None | Basic |
-| Bandwidth throttle | Token bucket rate limiter | None | None | Some |
-| Tag morphing | set/prefix/suffix/delete/strip | Lua scripts | dcmmodify (separate) | Some |
-| Schedule window | Auto-pause/resume | None | None | Some |
-| TLS encryption | Built-in | Plugin | Built-in | Varies |
-| Patient ID resolution | C-FIND + auto-remap | None | None | Some |
-| Post-migration verify | C-FIND instance + series | None | None | Some |
-| Storage commitment | N-ACTION formal verification | None | None | Some |
-| Targeted assoc fallback | Auto for rejected SOP classes | N/A | N/A | N/A |
-| Price | Free (MIT) | Free | Free | $$$$ |
+All columns are user-resizable by dragging headers.
 
-## FAQ / Troubleshooting
+---
 
-**Q: How fast is it?**
-With 4 workers on a gigabit LAN, expect 50-200+ files/second depending on PACS performance. The parallel architecture gives near-linear speedup up to the network or PACS bottleneck.
+## Configuration Reference
 
-**Q: What if my migration gets interrupted?**
-Resume is automatic. Re-run the same migration and it picks up where it left off, skipping all previously sent files via the manifest. Directory-level skip makes resume 200-400x faster than checking individual files.
+### Connection Settings
 
-**Q: Will this affect my production PACS?**
-Enable bandwidth throttling and schedule windowing to minimize impact. The tool can limit throughput to any rate and auto-pause outside business hours.
+| Setting | Description | Default |
+|---------|-------------|---------|
+| DICOM Folder | Source folder path (read-only access) | — |
+| Host / IP | Destination PACS address | — |
+| Port | DICOM port | 104 |
+| AE Title (SCU) | Calling AE title for this tool | DICOM_MIGRATOR |
+| AE Title (SCP) | Destination AE title | ANY-SCP |
+| PDU Size | Maximum Protocol Data Unit | 0 (Unlimited) |
 
-**Q: I'm getting "No presentation context" failures.**
-This typically means the destination doesn't support the SOP class or transfer syntax. The targeted association fallback (v1.0.1+) handles most of these automatically. If you still see failures with `Targeted assoc rejected`, the destination genuinely doesn't support that SOP class.
+### Transfer Options
 
-**Q: Does this work with [my PACS vendor]?**
-If your PACS supports DICOM C-STORE SCP (which all PACS systems do), this tool works. Tested with dcm4chee, Orthanc, and commercial systems.
+| Option | Description | Default |
+|--------|-------------|---------|
+| Workers | Parallel C-STORE associations (1 to 16) | 4 |
+| Batch Size | Files per association before renegotiation | 50 |
+| Retries | Per-file retry attempts before marking as failed | 1 |
+| Auto-retry waves | Post-migration retry passes for transient failures | 3 |
+| Conflict suffix | Suffix appended to PatientID when C-FIND resolution fails | _MIG |
 
-**Q: What about JPEG2000 or other compressed transfer syntaxes?**
-The tool negotiates all standard transfer syntaxes. If the destination rejects a compressed syntax, it automatically decompresses in-memory and retries — source files remain untouched.
+---
 
-**Q: The UI looks tiny/squished on my 4K display.**
-Update to v1.0.1+ which includes high-DPI scaling. If still an issue, set the environment variable `QT_SCALE_FACTOR=1.5` (or `2`) before launching.
+## HIPAA / Compliance
+
+### PHI Handling
+
+The following artifacts **contain Protected Health Information**:
+
+| Artifact | Contents | Location |
+|----------|----------|----------|
+| Migration Manifest | Patient names, IDs, study dates, descriptions | `~/.dicom_migrator/` |
+| HIPAA Audit Log | Per-file patient identifiers, timestamps, status | User-specified path |
+| CSV Export | Full manifest with all patient metadata | User-specified path |
+| Application Log | Patient names in status messages | In-memory / export |
+
+**Handle all exports in accordance with your organization's HIPAA security policies. Encrypt at rest when possible.**
+
+### Audit Log Format
+
+JSON-lines format, one event per line:
+
+```json
+{"timestamp": "2026-02-20T14:30:00", "event": "file_sent", "sop_uid": "1.2.3...", "patient": "DOE^JOHN", "patient_id": "12345", "status": "success"}
+```
+
+---
+
+## Troubleshooting
+
+### Association rejected on every file
+
+- Verify the destination AE title matches exactly — it is case-sensitive on many PACS systems
+- Confirm the destination PACS is configured to accept connections from your SCU AE title
+- Use the **Connection Assistant** to scan for the PACS and auto-populate settings
+- Try a **C-ECHO test** first to verify basic connectivity
+
+### Files rejected with 0xC000
+
+The destination cannot parse the file. The tool automatically attempts three recovery steps: stripping private tags, decompressing pixel data, and opening a targeted uncompressed-only association. If all three fail, the file has a structural issue — check the Log tab for specifics.
+
+### Patient ID conflicts (0xFFFB)
+
+A study already exists on the destination under different patient demographics. The tool queries the destination via C-FIND to discover the correct demographics, remaps the in-memory dataset to match, and resends. If C-FIND is unavailable or returns nothing, it falls back to appending a configurable suffix.
+
+### Migration seems slow
+
+- Increase workers in the Configuration tab (Workers spinner, up to 16)
+- Check the Log tab for adaptive throttle messages — it may be auto-limiting based on PACS latency
+- Disable the bandwidth throttle if your network has capacity
+- If running during clinical hours, Time-of-Day rate control may be reducing throughput
+- Verify PDU size is set to `0 (Unlimited)` — small PDU sizes dramatically reduce throughput
+
+### Resume after crash
+
+Click **Start Copy** again with the same source folder. The manifest automatically detects previously sent files and skips them instantly. No reconfiguration needed.
+
+---
+
+## Building a Standalone Executable
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --clean \
+    --name "DICOMPACSMigrator" \
+    --hidden-import "pydicom" \
+    --hidden-import "pynetdicom" \
+    --hidden-import "numpy" \
+    --hidden-import "PIL" \
+    --hidden-import "pylibjpeg" \
+    --collect-all pydicom \
+    --collect-all pynetdicom \
+    --exclude-module tkinter \
+    --exclude-module matplotlib \
+    dicom_migrator.py
+```
+
+Output: `dist/DICOMPACSMigrator.exe` (Windows) or `dist/DICOMPACSMigrator` (Linux/macOS).
+
+**Critical PyInstaller notes:**
+- Never `--exclude-module=logging` — PyQt5 crashes without it
+- Lazy imports inside functions need explicit `--hidden-import`
+- `--collect-all pydicom` ensures all transfer syntax handlers are bundled
+
+---
 
 ## Contributing
 
-Issues and PRs welcome. This is a single-file Python application — all code is in `dicom_migrator.py`.
+Issues and PRs welcome. This tool is actively used in production medical imaging environments.
+
+When submitting changes:
+
+- Test against at least one real PACS (Orthanc, dcm4chee, Horos, or commercial)
+- Maintain the copy-only guarantee — source files must never be modified
+- Preserve HIPAA audit trail integrity
+- Dark theme only
+
+---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+[MIT License](LICENSE)
+
+Copyright (c) 2026 SysAdminDoc
