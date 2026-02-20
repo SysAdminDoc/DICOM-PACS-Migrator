@@ -10,7 +10,8 @@
 
 > Production-grade DICOM C-STORE migration tool with a dark-themed GUI, parallel workers, self-healing retries, HIPAA audit logging, and a **copy-only architecture** that never modifies or deletes source data.
 
-![Screenshot](screenshot.png)
+<img width="2270" height="1066" alt="screenshot" src="https://github.com/user-attachments/assets/59e9d9d9-5df2-44d0-94d6-a0b0bc1f0e61" />
+
 
 ---
 
