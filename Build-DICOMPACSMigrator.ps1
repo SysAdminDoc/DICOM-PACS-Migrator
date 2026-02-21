@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Build script for DICOM PACS Migrator v0.2.0
+    Build script for DICOM PACS Migrator v2.1.0
     Compiles to a portable Windows .exe compatible with Server 2008+
 .DESCRIPTION
     - Downloads Python 3.8.20 embeddable if needed (last version supporting Server 2008)
@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 # Configuration
 # ============================================================================
 $ProjectName     = "DICOMPACSMigrator"
-$Version         = "0.2.0"
+$Version         = "2.2.0"
 $ScriptFile      = "dicom_migrator.py"
 $PythonVersion   = "3.8.10"
 $PythonMajorMin  = "38"
@@ -377,6 +377,7 @@ $piArgs = @(
     "--clean",
     "--noconfirm",
     "--name", $ProjectName,
+    "--icon", "`"$(Join-Path $ScriptDir 'icon.ico')`"",
     "--distpath", "`"$DistDir`"",
 
     # Hidden imports for pynetdicom internals

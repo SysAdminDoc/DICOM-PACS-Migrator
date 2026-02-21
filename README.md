@@ -1,6 +1,10 @@
 # DICOM PACS Migrator
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+<p align="center">
+  <img src="logo.png" alt="DICOM PACS Migrator" width="128">
+</p>
+
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
@@ -10,8 +14,7 @@
 
 > Production-grade DICOM C-STORE migration tool with a dark-themed GUI, parallel workers, self-healing retries, HIPAA audit logging, and a **copy-only architecture** that never modifies or deletes source data.
 
-<img width="2270" height="1066" alt="screenshot" src="https://github.com/user-attachments/assets/59e9d9d9-5df2-44d0-94d6-a0b0bc1f0e61" />
-
+![Screenshot](screenshot.png)
 
 ---
 
@@ -111,10 +114,55 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | Feature | Description |
 |---------|-------------|
 | Connection Assistant | Subnet scanner with TCP port probe + C-ECHO verification — auto-populates settings |
+| Connection Profiles | Save and load named connection profiles (host, port, AE titles) for quick switching between sites |
 | Tag Morphing | Modify DICOM tags in-memory during transfer (set, prefix, suffix, delete, strip_private) |
 | Modality / Date Filtering | Only send specific modalities (CR, DX, MR, CT...) or date ranges |
 | TLS Client Certificates | Load cert chain + CA for mutual TLS authentication |
 | Settings Persistence | All configuration saved and restored between sessions |
+| Drag-and-Drop | Drop a folder onto the window to set the source path |
+
+### Monitoring & Notifications
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| **Live Dashboard Tab** | Real-time throughput line chart (files/s + MB/s), success rate donut, per-study progress bars | Always on |
+| ETA in Title Bar | Window title and taskbar show `47% - ETA 2:14:30` during migration | Always on |
+| System Tray | Minimizes to tray with progress tooltip — double-click to restore | Enabled |
+| Sound Notification | System chime on migration completion or failure | Enabled |
+| Email Notification | SMTP email with migration summary on completion | Off |
+| Webhook POST | JSON payload to any endpoint (Slack, Teams, custom) on completion | Off |
+| Tray Notifications | Pop-up balloon from system tray on completion | Automatic |
+| Migration History | Persistent log of all past migrations (File > Migration History) | Automatic |
+| **Remote HTTP Monitor** | Tiny embedded web server with live dark-themed dashboard — check progress from your phone | Off |
+
+### Pre-Migration Analysis
+
+| Feature | Description |
+|---------|-------------|
+| **Pre-Migration Compatibility Scan** | Probe destination SOP classes + transfer syntaxes, cross-reference against every source file, show compatibility matrix |
+| **Dry Run Mode** | Simulate entire migration without sending — validates files, checks TS compatibility, reports what *would* happen |
+| **Speed Test Benchmark** | Send 5-10 representative files, measure actual throughput, estimate total migration time |
+| **Source Integrity Checkpoint** | SHA-256 hash all source files before migration, verify unchanged after — cryptographic proof of copy-only mode |
+| **Tag Morphing Preview** | Before/after diff table for a sample file when tag morphing rules are active |
+| **DICOM Image Preview** | Thumbnail preview with window/level in the File Browser — confirm you're migrating the right studies |
+
+### Scheduling & Multi-Target
+
+| Feature | Description |
+|---------|-------------|
+| **Delayed/Scheduled Start** | "Start migration at 7:00 PM tonight" with live countdown timer in the UI |
+| **Multi-Destination Fan-Out** | Send to 2+ PACS simultaneously (production + archive, or primary + DR site) |
+| **PDF Migration Report** | Professional HTML report with study-level results, compliance attestation, and configuration details |
+
+### Interface
+
+| Feature | Description |
+|---------|-------------|
+| Colored Log | Error (red), warning (yellow), success (green), skip (orange) with color legend |
+| Upload Table Filter | Search by patient name, ID, or description — filter by status (OK/FAIL/HEALED/REMAP) |
+| Right-Click Copy | Copy any cell or entire row from the upload table to clipboard |
+| About Dialog | Version, dependencies, Python version, GitHub link |
+| Menu Bar | File menu with profiles and migration history, Help menu with About and GitHub link |
 
 ---
 

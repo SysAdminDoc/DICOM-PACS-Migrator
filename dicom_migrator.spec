@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for DICOM PACS Migrator v1.0.1
+# PyInstaller spec for DICOM PACS Migrator v2.0.0
 # Build: pyinstaller dicom_migrator.spec
 
 a = Analysis(
@@ -72,5 +72,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,            # Add icon='icon.ico' if you have one
+    icon='icon.ico',
 )
