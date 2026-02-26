@@ -1,24 +1,40 @@
-# DICOM PACS Migrator
+<h1 align="center">
+  <br>
+  <img src="logo.png" alt="DICOM PACS Migrator" width="128">
+  <br>
+  DICOM PACS Migrator
+  <br>
+</h1>
 
 <p align="center">
-  <img src="logo.png" alt="DICOM PACS Migrator" width="128">
+  <b>DICOM C-STORE migration utility.</b>
 </p>
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
-![DICOM](https://img.shields.io/badge/DICOM-C--STORE%20%7C%20C--FIND%20%7C%20C--ECHO-0078D4)
-![Status](https://img.shields.io/badge/status-production--ready-success)
-![HIPAA](https://img.shields.io/badge/HIPAA-audit--logging-critical)
+<p align="center">
+  <img src="https://img.shields.io/badge/version-2.2.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/DICOM-C--STORE%20%7C%20C--FIND%20%7C%20C--ECHO-0078D4" alt="DICOM">
+  <img src="https://img.shields.io/badge/status-production--ready-success" alt="Status">
+  <img src="https://img.shields.io/badge/HIPAA-audit--logging-critical" alt="HIPAA">
+</p>
 
-> Production-grade DICOM C-STORE migration tool with a dark-themed GUI, parallel workers, self-healing retries, HIPAA audit logging, and a **copy-only architecture** that never modifies or deletes source data.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#features">Features</a> •
+  <a href="#how-it-works">How It Works</a> •
+  <a href="#usage">Usage</a> •
+  <a href="#configuration-reference">Configuration</a> •
+  <a href="#hipaa--compliance">HIPAA</a> •
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
-![Screenshot](screenshot_config.png)
-
-![Screenshot](screenshot_dashboard.png)
-
-![Screenshot](screenshot_upload.png)
+<p align="center">
+  <img src="screenshot_dashboard.png" alt="Dashboard" width="32%">
+  <img src="screenshot_config.png" alt="Configuration" width="32%">
+  <img src="screenshot_upload.png" alt="Upload" width="32%">
+</p>
 
 ---
 
@@ -44,7 +60,7 @@ Auto-installed dependencies: `PyQt5`, `pydicom`, `pynetdicom`, `numpy`, `Pillow`
 
 ## What It Does
 
-Copies DICOM images from a local folder (or legacy PACS export) to a destination PACS server via standard DICOM C-STORE. Handles the real-world problems that simple C-STORE scripts can't — compressed syntax rejection, patient ID conflicts, dead associations, PACS backpressure, and transfers measured in hundreds of thousands of files across clinical hours.
+Copies DICOM images from a local folder (or legacy PACS export) to a destination PACS server via standard DICOM C-STORE. Handles the real-world problems that simple C-STORE scripts can't, compressed syntax rejection, patient ID conflicts, dead associations, PACS backpressure, and transfers measured in hundreds of thousands of files across clinical hours.
 
 ### What It Does NOT Do
 
@@ -92,7 +108,24 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | Time-of-Day Rate Control | Reduce workers and add inter-file delay during clinical hours (configurable peak window) | Off |
 | Migration Schedule | Only run between configured start/end times — pauses outside the window | Off |
 
-### Verification & Compliance
+<details>
+<summary><b>Pre-Migration Analysis</b></summary>
+<br>
+
+| Feature | Description |
+|---------|-------------|
+| **Pre-Migration Compatibility Scan** | Probe destination SOP classes + transfer syntaxes, cross-reference against every source file, show compatibility matrix |
+| **Dry Run Mode** | Simulate entire migration without sending — validates files, checks TS compatibility, reports what *would* happen |
+| **Speed Test Benchmark** | Send 5-10 representative files, measure actual throughput, estimate total migration time |
+| **Source Integrity Checkpoint** | SHA-256 hash all source files before migration, verify unchanged after — cryptographic proof of copy-only mode |
+| **Tag Morphing Preview** | Before/after diff table for a sample file when tag morphing rules are active |
+| **DICOM Image Preview** | Thumbnail preview with window/level in the File Browser — confirm you're migrating the right studies |
+
+</details>
+
+<details>
+<summary><b>Verification & Compliance</b></summary>
+<br>
 
 | Feature | Description |
 |---------|-------------|
@@ -104,7 +137,11 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | HIPAA Audit Logging | JSON-lines structured log of every file sent/failed with patient identifiers |
 | CSV / Report Export | Export manifest, verification results, and full migration report |
 
-### Data Protection
+</details>
+
+<details>
+<summary><b>Data Protection</b></summary>
+<br>
 
 | Feature | Description |
 |---------|-------------|
@@ -113,7 +150,11 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | PHI-Aware Logging | All exports and logs carry PHI warnings — handle per HIPAA policy |
 | In-Memory Only Modifications | Decompression, tag morphing, and patient ID remapping happen in-memory only |
 
-### Network & Configuration
+</details>
+
+<details>
+<summary><b>Network & Configuration</b></summary>
+<br>
 
 | Feature | Description |
 |---------|-------------|
@@ -125,7 +166,23 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | Settings Persistence | All configuration saved and restored between sessions |
 | Drag-and-Drop | Drop a folder onto the window to set the source path |
 
-### Monitoring & Notifications
+</details>
+
+<details>
+<summary><b>Scheduling & Multi-Target</b></summary>
+<br>
+
+| Feature | Description |
+|---------|-------------|
+| **Delayed/Scheduled Start** | "Start migration at 7:00 PM tonight" with live countdown timer in the UI |
+| **Multi-Destination Fan-Out** | Send to 2+ PACS simultaneously (production + archive, or primary + DR site) |
+| **PDF Migration Report** | Professional HTML report with study-level results, compliance attestation, and configuration details |
+
+</details>
+
+<details>
+<summary><b>Monitoring & Notifications</b></summary>
+<br>
 
 | Feature | Description | Default |
 |---------|-------------|---------|
@@ -139,26 +196,11 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | Migration History | Persistent log of all past migrations (File > Migration History) | Automatic |
 | **Remote HTTP Monitor** | Tiny embedded web server with live dark-themed dashboard — check progress from your phone | Off |
 
-### Pre-Migration Analysis
+</details>
 
-| Feature | Description |
-|---------|-------------|
-| **Pre-Migration Compatibility Scan** | Probe destination SOP classes + transfer syntaxes, cross-reference against every source file, show compatibility matrix |
-| **Dry Run Mode** | Simulate entire migration without sending — validates files, checks TS compatibility, reports what *would* happen |
-| **Speed Test Benchmark** | Send 5-10 representative files, measure actual throughput, estimate total migration time |
-| **Source Integrity Checkpoint** | SHA-256 hash all source files before migration, verify unchanged after — cryptographic proof of copy-only mode |
-| **Tag Morphing Preview** | Before/after diff table for a sample file when tag morphing rules are active |
-| **DICOM Image Preview** | Thumbnail preview with window/level in the File Browser — confirm you're migrating the right studies |
-
-### Scheduling & Multi-Target
-
-| Feature | Description |
-|---------|-------------|
-| **Delayed/Scheduled Start** | "Start migration at 7:00 PM tonight" with live countdown timer in the UI |
-| **Multi-Destination Fan-Out** | Send to 2+ PACS simultaneously (production + archive, or primary + DR site) |
-| **PDF Migration Report** | Professional HTML report with study-level results, compliance attestation, and configuration details |
-
-### Interface
+<details>
+<summary><b>Interface</b></summary>
+<br>
 
 | Feature | Description |
 |---------|-------------|
@@ -167,6 +209,8 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 | Right-Click Copy | Copy any cell or entire row from the upload table to clipboard |
 | About Dialog | Version, dependencies, Python version, GitHub link |
 | Menu Bar | File menu with profiles and migration history, Help menu with About and GitHub link |
+
+</details>
 
 ---
 
