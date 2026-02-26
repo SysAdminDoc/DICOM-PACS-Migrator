@@ -218,7 +218,7 @@ Copies DICOM images from a local folder (or legacy PACS export) to a destination
 
 ```
 ┌──────────────────────┐     ┌─────────────────────────┐     ┌──────────────────────┐
-│   SOURCE FOLDER      │     │   DICOM PACS MIGRATOR    │     │   DESTINATION PACS   │
+│   SOURCE FOLDER      │     │   DICOM PACS MIGRATOR   │     │   DESTINATION PACS   │
 │   (Read-Only)        │     │                         │     │   (Receives Copies)  │
 │                      │     │  ┌───────────────────┐  │     │                      │
 │  DICOM files on      │────>│  │  Scanner Thread   │  │     │                      │
@@ -273,9 +273,9 @@ C-STORE attempt
   │   3. Targeted uncompressed  │ │  │
   │                             │ │  │
   ├─ 0xA700 Out of Resources    │ │  │
-  │   Backoff: 2s, 4s, 8s      │ │  │
+  │   Backoff: 2s, 4s, 8s       │ │  │
   │                             │ │  │
-  ├─ 0xA900 SOP Mismatch       │ │  │
+  ├─ 0xA900 SOP Mismatch        │ │  │
   │   Secondary Capture retry   │ │  │
   │                             │ │  │
   └─ Association Dead           │ │  │
