@@ -1,0 +1,7 @@
+build_env/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+build.log

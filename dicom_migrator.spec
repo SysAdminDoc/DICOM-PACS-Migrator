@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for DICOM PACS Migrator v2.0.0
+# PyInstaller spec for DICOM PACS Migrator v2.3.0
 # Build: pyinstaller dicom_migrator.spec
 
 a = Analysis(

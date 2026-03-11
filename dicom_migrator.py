@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v2.2.0
+DICOM PACS Migrator v2.3.0
 Production-grade DICOM C-STORE migration tool with parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
 morphing, modality/date filtering, TLS encryption, storage commitment verification,
@@ -43,7 +43,7 @@ def _bootstrap():
 
 _bootstrap()
 
-import json, time, logging, traceback, threading, socket, struct, ipaddress, re, csv, ssl, queue, hashlib, secrets
+import json, time, logging, traceback, threading, socket, struct, ipaddress, re, csv, ssl, queue, hashlib, secrets, sqlite3
 from pathlib import Path
 from datetime import datetime, time as dtime
 from collections import defaultdict
@@ -73,7 +73,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -1581,13 +1581,24 @@ QFrame[separator="true"] { background-color: #1e1e2e; max-height: 1px; }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Migration Manifest — Resume Support & Audit Trail
+# Migration Manifest — SQLite-Backed Resume Support & Audit Trail
 # ═══════════════════════════════════════════════════════════════════════════════
 class MigrationManifest:
-    """Persistent JSON manifest tracking every file's migration status.
-    Enables resume after crash and CSV export for audit.
+    """Persistent SQLite manifest tracking every file's migration status.
+    Uses WAL mode for crash-safe incremental writes — no full-file serialization.
+    Maintains in-memory dict for fast lookups; each record_file() writes to SQLite
+    immediately (within a transaction committed by save()). Scales to millions of
+    files without slowdown.
     WARNING: Manifests contain PHI (patient names, IDs, study metadata).
     Handle in accordance with HIPAA security policies."""
+
+    _DB_COLS = ('sop_uid', 'path', 'status', 'message', 'timestamp', 'retry_count',
+                'patient_name', 'patient_id', 'study_date', 'study_desc',
+                'series_desc', 'modality', 'study_instance_uid',
+                'series_instance_uid', 'sop_class_uid')
+    _UPSERT_SQL = ("INSERT OR REPLACE INTO records ("
+                   + ",".join(_DB_COLS) + ") VALUES ("
+                   + ",".join("?" for _ in _DB_COLS) + ")")
 
     def __init__(self, manifest_path=None, save_to_disk=True):
         self.path = manifest_path
@@ -1599,70 +1610,159 @@ class MigrationManifest:
             'source_folder': '',
             'destination': '',
         }
+        self._db = None
+        self._json_migration_source = None
+
+    def _init_db(self):
+        """Initialize SQLite database with WAL mode for fast incremental writes."""
+        if not self.path or not self.save_to_disk:
+            return
+        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS records (
+                sop_uid TEXT PRIMARY KEY,
+                path TEXT, status TEXT, message TEXT, timestamp TEXT,
+                retry_count INTEGER DEFAULT 0,
+                patient_name TEXT, patient_id TEXT, study_date TEXT,
+                study_desc TEXT, series_desc TEXT, modality TEXT,
+                study_instance_uid TEXT, series_instance_uid TEXT,
+                sop_class_uid TEXT
+            )""")
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY, value TEXT
+            )""")
+        # Index for fast resume queries
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_status ON records(status)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_path ON records(path)")
+        self._db.commit()
 
     def set_path_from_folder(self, source_folder):
         safe = re.sub(r'[^\w\-.]', '_', os.path.basename(source_folder.rstrip('/\\')))
         manifest_dir = os.path.join(os.path.expanduser("~"), ".dicom_migrator")
         os.makedirs(manifest_dir, exist_ok=True)
 
-        # Look for existing manifest for this source folder (any date)
-        # Enables seamless resume across sessions even days apart
+        # Look for existing manifest — prefer .db (SQLite), fall back to .json for migration
         prefix = f"migration_manifest_{safe}_"
-        existing = sorted(
+        existing_db = sorted(
+            [f for f in os.listdir(manifest_dir) if f.startswith(prefix) and f.endswith('.db')],
+            reverse=True)
+        existing_json = sorted(
             [f for f in os.listdir(manifest_dir) if f.startswith(prefix) and f.endswith('.json')],
-            reverse=True)  # Most recent date first
-        if existing:
-            self.path = os.path.join(manifest_dir, existing[0])
+            reverse=True)
+
+        if existing_db:
+            self.path = os.path.join(manifest_dir, existing_db[0])
+        elif existing_json:
+            # Mark for JSON -> SQLite migration on load()
+            json_path = os.path.join(manifest_dir, existing_json[0])
+            db_name = existing_json[0].replace('.json', '.db')
+            self.path = os.path.join(manifest_dir, db_name)
+            self._json_migration_source = json_path
         else:
-            fname = f"{prefix}{datetime.now().strftime('%Y%m%d')}.json"
+            fname = f"{prefix}{datetime.now().strftime('%Y%m%d')}.db"
             self.path = os.path.join(manifest_dir, fname)
         self.meta['source_folder'] = source_folder
 
+    def _migrate_from_json(self, json_path):
+        """One-time migration from legacy JSON manifest to SQLite."""
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            self.meta = data.get('meta', self.meta)
+            json_records = data.get('records', {})
+
+            self._init_db()
+
+            # Batch insert all records in a single transaction
+            rows = []
+            for sop, rec in json_records.items():
+                rows.append((
+                    sop, rec.get('path', ''), rec.get('status', ''),
+                    rec.get('message', ''), rec.get('timestamp', ''),
+                    rec.get('retry_count', 0),
+                    rec.get('patient_name', ''), rec.get('patient_id', ''),
+                    rec.get('study_date', ''), rec.get('study_desc', ''),
+                    rec.get('series_desc', ''), rec.get('modality', ''),
+                    rec.get('study_instance_uid', ''), rec.get('series_instance_uid', ''),
+                    rec.get('sop_class_uid', '')))
+            if rows:
+                self._db.executemany(self._UPSERT_SQL, rows)
+            for key, value in self.meta.items():
+                self._db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+            self._db.commit()
+
+            self.records = json_records
+
+            # Rename JSON so we don't re-migrate next time
+            try: os.rename(json_path, json_path + '.migrated')
+            except Exception: pass
+
+            return True
+        except Exception:
+            if not self._db:
+                self._init_db()
+            return False
+
     def load(self):
-        if self.path and os.path.exists(self.path):
+        if not self.path:
+            return False
+
+        # Migrate from legacy JSON if needed
+        if self._json_migration_source and os.path.exists(self._json_migration_source):
+            return self._migrate_from_json(self._json_migration_source)
+
+        if not os.path.exists(self.path):
+            self._init_db()
+            return False
+
+        try:
+            self._init_db()
+            cursor = self._db.execute(
+                "SELECT sop_uid, path, status, message, timestamp, retry_count, "
+                "patient_name, patient_id, study_date, study_desc, series_desc, "
+                "modality, study_instance_uid, series_instance_uid, sop_class_uid "
+                "FROM records")
+            for row in cursor:
+                self.records[row[0]] = {
+                    'path': row[1], 'status': row[2], 'message': row[3],
+                    'timestamp': row[4], 'retry_count': row[5],
+                    'patient_name': row[6], 'patient_id': row[7],
+                    'study_date': row[8], 'study_desc': row[9],
+                    'series_desc': row[10], 'modality': row[11],
+                    'study_instance_uid': row[12], 'series_instance_uid': row[13],
+                    'sop_class_uid': row[14],
+                }
+            # Load metadata
             try:
-                with open(self.path, 'r') as f:
-                    data = json.load(f)
-                self.meta = data.get('meta', self.meta)
-                self.records = data.get('records', {})
-                return True
-            except Exception:
-                return False
-        return False
+                for key, value in self._db.execute("SELECT key, value FROM meta"):
+                    self.meta[key] = value
+            except Exception: pass
+            return bool(self.records)
+        except Exception:
+            if not self._db:
+                self._init_db()
+            return False
 
     def save(self):
-        if not self.path or not self.save_to_disk:
+        """Commit pending SQLite writes. Fast — just a transaction commit, not full serialization."""
+        if not self._db or not self.save_to_disk:
             return
         try:
-            import tempfile
-            dir_name = os.path.dirname(self.path)
-            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
-            with os.fdopen(fd, 'w') as f:
-                json.dump({'meta': self.meta, 'records': self.records}, f, indent=2)
-            # Atomic rename (works on same filesystem)
-            if os.path.exists(self.path):
-                os.replace(tmp_path, self.path)
-            else:
-                os.rename(tmp_path, self.path)
+            for key, value in self.meta.items():
+                self._db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+            self._db.commit()
         except Exception:
-            # Clean up orphaned temp file
-            try:
-                if 'tmp_path' in dir() and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except: pass
-            # Fall back to direct write if atomic fails
-            try:
-                with open(self.path, 'w') as f:
-                    json.dump({'meta': self.meta, 'records': self.records}, f, indent=2)
-            except Exception:
-                pass
+            pass
 
     def record_file(self, sop_uid, path, status, message='', **extra):
         existing = self.records.get(sop_uid, {})
         prev_retries = existing.get('retry_count', 0)
         # Increment retry count if re-recording a previously failed file
         retry_count = prev_retries + 1 if existing.get('status') == 'failed' and status == 'failed' else prev_retries
-        self.records[sop_uid] = {
+        rec = {
             'path': path,
             'status': status,  # 'sent', 'failed', 'skipped'
             'message': message,
@@ -1670,6 +1770,20 @@ class MigrationManifest:
             'retry_count': retry_count,
             **extra,
         }
+        self.records[sop_uid] = rec
+
+        # Persist immediately to SQLite (within current transaction, committed on save())
+        if self._db:
+            try:
+                self._db.execute(self._UPSERT_SQL, (
+                    sop_uid, path, status, message, rec['timestamp'], retry_count,
+                    extra.get('patient_name', ''), extra.get('patient_id', ''),
+                    extra.get('study_date', ''), extra.get('study_desc', ''),
+                    extra.get('series_desc', ''), extra.get('modality', ''),
+                    extra.get('study_instance_uid', ''), extra.get('series_instance_uid', ''),
+                    extra.get('sop_class_uid', '')))
+            except Exception:
+                pass
 
     def is_already_sent(self, sop_uid):
         rec = self.records.get(sop_uid)
@@ -1782,6 +1896,15 @@ class MigrationManifest:
 
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
+
+    def close(self):
+        """Flush and close the SQLite database."""
+        if self._db:
+            try:
+                self._db.commit()
+                self._db.close()
+            except Exception: pass
+            self._db = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2063,12 +2186,14 @@ _SENTINEL = object()  # Unique sentinel — signals worker to stop
 
 def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                   file_queue, result_queue, cancel_event, pause_event,
-                  decompress_fallback, conflict_retry, conflict_suffix,
+                  live_config,
                   pid_cache, pid_cache_lock, retry_count,
                   throttle=None, tag_rules=None, tls_context=None,
                   circuit_breaker=None, adaptive_throttle=None,
                   tod_rate_control=None, priority_queue=None):
-    """Worker thread: maintains its own DICOM association and processes files from queue."""
+    """Worker thread: maintains its own DICOM association and processes files from queue.
+    Reads decompress_fallback, conflict_retry, conflict_suffix from live_config dict
+    each iteration so changes take effect immediately without restart."""
     assoc = None
 
     def _get_assoc(ae):
@@ -2169,10 +2294,15 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 with pid_cache_lock:
                     local_cache = dict(pid_cache)
 
+            # Read live-configurable settings (may change mid-run via GUI)
+            _decompress = live_config.get('decompress_fallback', True)
+            _conflict = live_config.get('conflict_retry', False)
+            _suffix = live_config.get('conflict_suffix', '_MIG')
+
             _send_start = time.monotonic()
             sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
-                assoc, ds, fpath, decompress_fallback,
-                conflict_retry, conflict_suffix,
+                assoc, ds, fpath, _decompress,
+                _conflict, _suffix,
                 log_fn=None,
                 ae=ae, host=host, port=port,
                 ae_scp=ae_scp, ae_scu=ae_scu,
@@ -2301,10 +2431,48 @@ class UploadThread(QThread):
         # Adaptive latency-based throttle
         self._adaptive_throttle = AdaptiveThrottle(target_latency=1.0, max_delay=5.0)
         self._adaptive_throttle.enabled = adaptive_throttle_enabled
+        # Live-configurable settings — shared dict read by workers each iteration
+        self._live_config = {
+            'decompress_fallback': decompress_fallback,
+            'conflict_retry': conflict_retry,
+            'conflict_suffix': conflict_suffix,
+            'batch_size': batch_size,
+        }
 
     def cancel(self): self._cancel = True; self._cancel_event.set(); self._pause_event.set()
     def pause(self): self._paused = True; self._pause_event.clear()
     def resume(self): self._paused = False; self._pause_event.set()
+
+    def update_live_settings(self, **kwargs):
+        """Push setting changes to the running thread. Called from GUI thread.
+        Supported keys: decompress_fallback, conflict_retry, conflict_suffix,
+        batch_size, throttle_rate, adaptive_enabled, tod_enabled, tod_peak_delay,
+        tod_peak_workers, tod_peak_start, tod_peak_end."""
+        for key, val in kwargs.items():
+            if key in ('decompress_fallback', 'conflict_retry', 'conflict_suffix', 'batch_size'):
+                self._live_config[key] = val
+            elif key == 'throttle_rate':
+                if self.throttle:
+                    self.throttle.set_rate(val)
+                elif val > 0:
+                    self.throttle = BandwidthThrottle(val, cancel_event=self._cancel_event)
+            elif key == 'throttle_enabled':
+                if not val and self.throttle:
+                    self.throttle.enabled = False
+                elif val and self.throttle:
+                    self.throttle.enabled = True
+            elif key == 'adaptive_enabled':
+                self._adaptive_throttle.enabled = val
+            elif key == 'tod_enabled' and self._tod_rate_control:
+                self._tod_rate_control.enabled = val
+            elif key == 'tod_peak_delay' and self._tod_rate_control:
+                self._tod_rate_control.peak_delay = val
+            elif key == 'tod_peak_workers' and self._tod_rate_control:
+                self._tod_rate_control.peak_workers = max(1, val)
+            elif key == 'tod_peak_start' and self._tod_rate_control:
+                self._tod_rate_control.peak_start = val
+            elif key == 'tod_peak_end' and self._tod_rate_control:
+                self._tod_rate_control.peak_end = val
 
     def prioritize_study(self, study_uid):
         """Move a study to the front of the queue. Files matching this study_uid
@@ -2464,7 +2632,7 @@ class UploadThread(QThread):
                 args=(wid, ae_builder, self.host, self.port,
                       self.ae_scp, self.ae_scu,
                       file_q, result_q, self._cancel_event, self._pause_event,
-                      self.decompress_fallback, self.conflict_retry, self.conflict_suffix,
+                      self._live_config,
                       self._pid_cache, self._pid_cache_lock, self.retry_count,
                       self.throttle, self.tag_rules, self.tls_context,
                       self._circuit_breaker, self._adaptive_throttle,
@@ -2657,9 +2825,10 @@ class UploadThread(QThread):
         """Original serial send path — one association at a time."""
         sent = failed = 0; bytes_sent = 0; file_index = 0
         _a700_consecutive = 0  # Adaptive backoff for PACS backpressure
-        for batch_start in range(0, total, self.batch_size):
+        _batch_sz = self._live_config.get('batch_size', self.batch_size)
+        for batch_start in range(0, total, _batch_sz):
             if self._cancel: break
-            batch = self.files[batch_start:batch_start + self.batch_size]
+            batch = self.files[batch_start:batch_start + _batch_sz]
             ae = self._build_ae(list(set(f['sop_class_uid'] for f in batch)))
             for attempt in range(self.retry_count + 1):
                 if self._cancel: break
@@ -2730,8 +2899,10 @@ class UploadThread(QThread):
                                 apply_tag_rules(ds, self.tag_rules)
 
                             sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
-                                assoc, ds, fpath, self.decompress_fallback,
-                                self.conflict_retry, self.conflict_suffix,
+                                assoc, ds, fpath,
+                                self._live_config.get('decompress_fallback', True),
+                                self._live_config.get('conflict_retry', False),
+                                self._live_config.get('conflict_suffix', '_MIG'),
                                 log_fn=self.log.emit,
                                 ae=ae, host=self.host, port=self.port,
                                 ae_scp=self.ae_scp, ae_scu=self.ae_scu,
@@ -2834,8 +3005,6 @@ class UploadThread(QThread):
                 matching = [f for f in self.files if f.get('sop_instance_uid', '') == uid]
                 if matching:
                     retry_files.extend(matching)
-                    # Clear sent status so they get re-attempted
-                    del self.manifest.records[uid]
 
             if not retry_files:
                 break
@@ -2843,9 +3012,10 @@ class UploadThread(QThread):
             self.log.emit(f"Auto-retry wave {wave}: re-sending {len(retry_files)} files...")
             wave_sent = wave_failed = 0
 
-            for batch_start in range(0, len(retry_files), self.batch_size):
+            _batch_sz = self._live_config.get('batch_size', self.batch_size)
+            for batch_start in range(0, len(retry_files), _batch_sz):
                 if self._cancel: break
-                batch = retry_files[batch_start:batch_start + self.batch_size]
+                batch = retry_files[batch_start:batch_start + _batch_sz]
                 ae = self._build_ae(list(set(f['sop_class_uid'] for f in batch)))
                 try:
                     assoc = self._associate(ae)
@@ -2859,8 +3029,10 @@ class UploadThread(QThread):
                             if self.tag_rules:
                                 apply_tag_rules(ds, self.tag_rules)
                             sv, detail, wd, wc, na = try_send_c_store(
-                                assoc, ds, fpath, self.decompress_fallback,
-                                self.conflict_retry, self.conflict_suffix,
+                                assoc, ds, fpath,
+                                self._live_config.get('decompress_fallback', True),
+                                self._live_config.get('conflict_retry', False),
+                                self._live_config.get('conflict_suffix', '_MIG'),
                                 log_fn=self.log.emit, ae=ae, host=self.host,
                                 port=self.port, ae_scp=self.ae_scp, ae_scu=self.ae_scu,
                                 pid_cache=self._pid_cache, tls_context=self.tls_context)
@@ -2967,10 +3139,45 @@ class StreamingMigrationThread(QThread):
         self._adaptive_throttle.enabled = adaptive_throttle_enabled
         if self._tod_rate_control:
             self._tod_rate_control._cancel_event = self._cancel_event
+        # Live-configurable settings — shared dict read per-file
+        self._live_config = {
+            'decompress_fallback': decompress_fallback,
+            'conflict_retry': conflict_retry,
+            'conflict_suffix': conflict_suffix,
+            'batch_size': batch_size,
+        }
 
     def cancel(self): self._cancel = True; self._cancel_event.set(); self._pause_event.set()
     def pause(self): self._paused = True; self._pause_event.clear()
     def resume(self): self._paused = False; self._pause_event.set()
+
+    def update_live_settings(self, **kwargs):
+        """Push setting changes to the running thread. Called from GUI thread."""
+        for key, val in kwargs.items():
+            if key in ('decompress_fallback', 'conflict_retry', 'conflict_suffix', 'batch_size'):
+                self._live_config[key] = val
+            elif key == 'throttle_rate':
+                if self.throttle:
+                    self.throttle.set_rate(val)
+                elif val > 0:
+                    self.throttle = BandwidthThrottle(val, cancel_event=self._cancel_event)
+            elif key == 'throttle_enabled':
+                if not val and self.throttle:
+                    self.throttle.enabled = False
+                elif val and self.throttle:
+                    self.throttle.enabled = True
+            elif key == 'adaptive_enabled':
+                self._adaptive_throttle.enabled = val
+            elif key == 'tod_enabled' and self._tod_rate_control:
+                self._tod_rate_control.enabled = val
+            elif key == 'tod_peak_delay' and self._tod_rate_control:
+                self._tod_rate_control.peak_delay = val
+            elif key == 'tod_peak_workers' and self._tod_rate_control:
+                self._tod_rate_control.peak_workers = max(1, val)
+            elif key == 'tod_peak_start' and self._tod_rate_control:
+                self._tod_rate_control.peak_start = val
+            elif key == 'tod_peak_end' and self._tod_rate_control:
+                self._tod_rate_control.peak_end = val
 
     def _associate(self, ae):
         """Create association with optional TLS."""
@@ -3079,8 +3286,10 @@ class StreamingMigrationThread(QThread):
 
                         _send_start = time.monotonic()
                         sv, detail, was_decompressed, was_conflict_retried, new_assoc = try_send_c_store(
-                            assoc, ds, fpath, self.decompress_fallback,
-                            self.conflict_retry, self.conflict_suffix,
+                            assoc, ds, fpath,
+                            self._live_config.get('decompress_fallback', True),
+                            self._live_config.get('conflict_retry', False),
+                            self._live_config.get('conflict_suffix', '_MIG'),
                             log_fn=self.log.emit,
                             ae=ae, host=self.host, port=self.port,
                             ae_scp=self.ae_scp, ae_scu=self.ae_scu,
@@ -3309,8 +3518,10 @@ class StreamingMigrationThread(QThread):
                             if self.tag_rules:
                                 apply_tag_rules(ds, self.tag_rules)
                             sv, detail, wd, wc, na = try_send_c_store(
-                                assoc, ds, fpath, self.decompress_fallback,
-                                self.conflict_retry, self.conflict_suffix,
+                                assoc, ds, fpath,
+                                self._live_config.get('decompress_fallback', True),
+                                self._live_config.get('conflict_retry', False),
+                                self._live_config.get('conflict_suffix', '_MIG'),
                                 log_fn=self.log.emit, ae=ae, host=self.host,
                                 port=self.port, ae_scp=self.ae_scp, ae_scu=self.ae_scu,
                                 pid_cache=self._pid_cache, tls_context=self.tls_context)
@@ -3405,9 +3616,11 @@ class StreamingMigrationThread(QThread):
                     args=(wid, ae_builder, self.host, self.port,
                           self.ae_scp, self.ae_scu,
                           file_q, result_q, self._cancel_event, self._pause_event,
-                          self.decompress_fallback, self.conflict_retry, self.conflict_suffix,
+                          self._live_config,
                           self._pid_cache, self._pid_cache_lock, self.retry_count,
-                          self.throttle, self.tag_rules, self.tls_context))
+                          self.throttle, self.tag_rules, self.tls_context,
+                          self._circuit_breaker, self._adaptive_throttle,
+                          self._tod_rate_control))
                 t.start()
                 worker_threads.append(t)
 
@@ -3556,9 +3769,10 @@ class StreamingMigrationThread(QThread):
                 self.log.emit(f"  [{dirs_done}] {rel_dir}: {len(dir_files)} DICOM files")
 
             # Send this directory's files in batches
-            for batch_start in range(0, len(dir_files), self.batch_size):
+            _batch_sz = self._live_config.get('batch_size', self.batch_size)
+            for batch_start in range(0, len(dir_files), _batch_sz):
                 if self._cancel: break
-                batch = dir_files[batch_start:batch_start + self.batch_size]
+                batch = dir_files[batch_start:batch_start + _batch_sz]
                 if self.workers > 1:
                     sent, failed, skipped, bytes_sent = self._send_batch_parallel(
                         batch, sent, failed, skipped, bytes_sent, start_time,
@@ -4542,6 +4756,7 @@ class MainWindow(QMainWindow):
         self._remote_monitor = None
         self._original_title = f"{APP_NAME} v{VERSION}"
         self._build_ui(); self._build_menu_bar(); self._setup_tray(); self._load_settings()
+        self._connect_live_settings()
 
     def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central)
@@ -4691,7 +4906,7 @@ class MainWindow(QMainWindow):
 
         self.manifest_check = QCheckBox("Save resume manifest (crash recovery)")
         self.manifest_check.setChecked(True)
-        self.manifest_check.setToolTip("Saves JSON manifest to ~/.dicom_migrator/ for crash recovery.")
+        self.manifest_check.setToolTip("Saves SQLite manifest to ~/.dicom_migrator/ for crash recovery.\nAuto-migrates legacy JSON manifests.")
         al.addWidget(self.manifest_check)
 
         self.decompress_check = QCheckBox("Decompress if destination rejects compressed syntax")
@@ -5308,6 +5523,48 @@ class MainWindow(QMainWindow):
         layout.addWidget(sp_frame)
 
         return w
+
+    # ─── Live Settings Sync ─────────────────────────────────────────────
+    def _sync_live_settings(self):
+        """Push current widget values to the running upload/streaming thread.
+        Connected to widget signals so changes take effect immediately."""
+        thread = None
+        if hasattr(self, 'streaming_thread') and self.streaming_thread and self.streaming_thread.isRunning():
+            thread = self.streaming_thread
+        elif hasattr(self, 'upload_thread') and self.upload_thread and self.upload_thread.isRunning():
+            thread = self.upload_thread
+        if not thread:
+            return
+
+        thread.update_live_settings(
+            decompress_fallback=self.decompress_check.isChecked(),
+            conflict_retry=self.conflict_retry_check.isChecked(),
+            conflict_suffix=self.conflict_suffix_input.text().strip() or "_MIG",
+            batch_size=self.batch_spin.value(),
+            throttle_enabled=self.throttle_check.isChecked(),
+            throttle_rate=self.throttle_rate.value() if self.throttle_check.isChecked() else 0.0,
+            adaptive_enabled=self.adaptive_throttle_check.isChecked(),
+            tod_enabled=self.tod_check.isChecked(),
+            tod_peak_delay=self.tod_delay_spin.value(),
+            tod_peak_workers=self.tod_workers_spin.value(),
+            tod_peak_start=dtime(self.tod_start.time().hour(), self.tod_start.time().minute()),
+            tod_peak_end=dtime(self.tod_end.time().hour(), self.tod_end.time().minute()),
+        )
+
+    def _connect_live_settings(self):
+        """Wire config widgets so changes propagate to running threads instantly."""
+        self.decompress_check.stateChanged.connect(self._sync_live_settings)
+        self.conflict_retry_check.stateChanged.connect(self._sync_live_settings)
+        self.conflict_suffix_input.textChanged.connect(self._sync_live_settings)
+        self.batch_spin.valueChanged.connect(self._sync_live_settings)
+        self.throttle_check.stateChanged.connect(self._sync_live_settings)
+        self.throttle_rate.valueChanged.connect(self._sync_live_settings)
+        self.adaptive_throttle_check.stateChanged.connect(self._sync_live_settings)
+        self.tod_check.stateChanged.connect(self._sync_live_settings)
+        self.tod_delay_spin.valueChanged.connect(self._sync_live_settings)
+        self.tod_workers_spin.valueChanged.connect(self._sync_live_settings)
+        self.tod_start.timeChanged.connect(self._sync_live_settings)
+        self.tod_end.timeChanged.connect(self._sync_live_settings)
 
     # ─── Dashboard Update Timer ────────────────────────────────────────────
     def _start_dashboard_timer(self):
@@ -7051,6 +7308,9 @@ tr:nth-child(even) {{ background: #181825; }}
                 return
         if self._tray_icon:
             self._tray_icon.hide()
+        if hasattr(self, 'manifest') and self.manifest:
+            self.manifest.save()
+            self.manifest.close()
         event.accept()
 
     # ═══════════════════════════════════════════════════════════════════════════
