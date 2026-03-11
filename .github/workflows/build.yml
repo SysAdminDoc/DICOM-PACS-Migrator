@@ -9,6 +9,9 @@ on:
         description: 'Release tag to attach binaries to (e.g. v3.1.0). Leave empty for artifact-only build.'
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -18,9 +21,10 @@ jobs:
           - os: windows-latest
             artifact: DICOM_PACS_Migrator-Windows.exe
             binary: dist/DICOM_PACS_Migrator.exe
-          - os: macos-13          # x64 runner (PyQt5 has no arm64 wheels)
+          - os: macos-latest
             artifact: DICOM_PACS_Migrator-macOS
             binary: dist/DICOM_PACS_Migrator
+            python-arch: x64       # PyQt5 has no arm64 wheels — use x64 via Rosetta
           - os: ubuntu-22.04
             artifact: DICOM_PACS_Migrator-Linux
             binary: dist/DICOM_PACS_Migrator
@@ -34,6 +38,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          architecture: ${{ matrix.python-arch || 'x64' }}
 
       # Linux: install Qt runtime dependencies (headless OK for build)
       - name: Install system dependencies (Linux)
