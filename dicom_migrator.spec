@@ -2,6 +2,13 @@
 # PyInstaller spec for DICOM PACS Migrator v3.1.0
 # Build: pyinstaller dicom_migrator.spec
 
+import sys
+import os
+
+_icon = None
+if sys.platform == 'win32' and os.path.exists('icon.ico'):
+    _icon = 'icon.ico'
+
 a = Analysis(
     ['dicom_migrator.py'],
     pathex=[],
@@ -71,5 +78,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico',
+    icon=_icon,
 )
