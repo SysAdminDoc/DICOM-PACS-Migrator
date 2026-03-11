@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v2.3.0
-Production-grade DICOM C-STORE migration tool with parallel worker associations,
+DICOM PACS Migrator v3.0.0
+Production-grade DICOM C-STORE migration tool with premium sidebar navigation,
+frameless window, glassmorphic UI, parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
 morphing, modality/date filtering, TLS encryption, storage commitment verification,
 post-migration C-FIND audit, network auto-discovery, resume support, streaming
@@ -10,7 +11,9 @@ duplicate skip, DICOM validation, error classification, circuit breaker destinat
 protection, adaptive latency-based throttling, transfer syntax probing, pre-migration
 data quality analysis, HIPAA audit logging, auto-verify two-point confirmation,
 study-level batching, time-of-day peak-hours rate control, SOP class fallback
-to Secondary Capture, priority queue for urgent studies, and batched Storage Commitment.
+to Secondary Capture, priority queue for urgent studies, batched Storage Commitment,
+two-pass date-range pre-filter scanning, threaded parallel scan with SQLite cache,
+DICOM magic byte pre-check, and extension-based non-DICOM skip.
 Copy-only architecture — source data is NEVER modified or deleted.
 """
 # SPDX-License-Identifier: MIT
@@ -57,10 +60,19 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QStatusBar, QMessageBox, QDialog,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QDateEdit, QDateTimeEdit,
     QTimeEdit, QDoubleSpinBox, QPlainTextEdit, QMenu, QAction,
-    QSystemTrayIcon, QMenuBar, QInputDialog, QScrollArea
+    QSystemTrayIcon, QMenuBar, QInputDialog, QScrollArea,
+    QStackedWidget, QGraphicsDropShadowEffect
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QDate, QTime, QUrl, QMimeData, QDateTime, QRectF
-from PyQt5.QtGui import QFont, QColor, QIcon, QPalette, QPixmap, QTextCursor, QDesktopServices, QPainter, QPen, QBrush, QPainterPath, QLinearGradient
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QSettings, QDate, QTime, QUrl,
+    QMimeData, QDateTime, QRectF, QPropertyAnimation, QEasingCurve,
+    QPoint, QSize, QEvent, QRect, pyqtProperty
+)
+from PyQt5.QtGui import (
+    QFont, QColor, QIcon, QPalette, QPixmap, QTextCursor, QDesktopServices,
+    QPainter, QPen, QBrush, QPainterPath, QLinearGradient,
+    QCursor
+)
 
 import pydicom
 from pydicom.uid import (
@@ -73,7 +85,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "2.3.0"
+VERSION = "3.1.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -201,6 +213,249 @@ logger = logging.getLogger("DICOMMigrator")
 logger.setLevel(logging.INFO)  # Production: INFO level — DEBUG available via --debug flag
 
 COMMON_DICOM_PORTS = [104, 11112, 4242, 2762, 2575, 8042, 4006, 5678, 3003, 106]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scan Optimization — Two-pass scanning with threaded I/O (v2.3.0)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Extensions that are NEVER DICOM — skip instantly without reading headers
+_SKIP_EXTENSIONS = frozenset({
+    '.exe', '.dll', '.sys', '.bat', '.cmd', '.msi', '.com',  # Windows executables
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.svg', '.ico',  # Images (non-DICOM)
+    '.mp3', '.mp4', '.avi', '.mov', '.mkv', '.wav', '.flac', '.wmv',  # Media
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',  # Documents
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',  # Archives
+    '.xml', '.html', '.htm', '.css', '.js', '.json', '.yaml', '.yml',  # Web/config
+    '.txt', '.log', '.md', '.ini', '.cfg', '.conf', '.reg',  # Text/config
+    '.py', '.java', '.cpp', '.c', '.h', '.cs', '.rb', '.go',  # Source code
+    '.db', '.sqlite', '.mdb', '.accdb',  # Database
+    '.lnk', '.url', '.desktop',  # Shortcuts
+    '.tmp', '.bak', '.swp',  # Temp files
+})
+
+# Tags needed for Pass 1 (date filter only)
+_PASS1_TAGS = ['StudyDate']
+
+# Tags needed for Pass 2 (full metadata)
+_PASS2_TAGS = [
+    'PatientName', 'PatientID', 'StudyDate', 'StudyDescription',
+    'SeriesDescription', 'Modality', 'SOPClassUID', 'SOPInstanceUID',
+    'StudyInstanceUID', 'SeriesInstanceUID',
+]
+
+
+def _has_dicom_magic(filepath):
+    """Check for DICOM Part 10 magic bytes ('DICM' at offset 128).
+    Returns True if magic found, False if not, None on read error."""
+    try:
+        with open(filepath, 'rb') as f:
+            f.seek(128)
+            return f.read(4) == b'DICM'
+    except Exception:
+        return None
+
+
+def _should_skip_extension(filepath):
+    """Returns True if file extension is known non-DICOM."""
+    return Path(filepath).suffix.lower() in _SKIP_EXTENSIONS
+
+
+def _quick_read_study_date(filepath):
+    """Ultra-fast single-tag read: extract only StudyDate from DICOM header.
+    Returns date string (YYYYMMDD) or None if not DICOM or no StudyDate.
+    Note: with specific_tags, only StudyDate is populated — SOPClassUID is
+    NOT available here. Full DICOM validation happens in Pass 2."""
+    try:
+        ds = pydicom.dcmread(str(filepath), stop_before_pixels=True, force=True,
+                             specific_tags=_PASS1_TAGS)
+        sd = str(getattr(ds, 'StudyDate', ''))
+        return sd if sd else None
+    except Exception:
+        return None
+
+
+def _read_dicom_metadata(filepath):
+    """Pass 2: Read full scan metadata from a DICOM file using targeted tags.
+    Returns dict of metadata or None if not valid DICOM."""
+    try:
+        ds = pydicom.dcmread(str(filepath), stop_before_pixels=True, force=True,
+                             specific_tags=_PASS2_TAGS)
+        if not hasattr(ds, 'SOPClassUID'):
+            return None
+        return {
+            'path': str(filepath),
+            'patient_name': str(getattr(ds, 'PatientName', 'Unknown')),
+            'patient_id': str(getattr(ds, 'PatientID', 'N/A')),
+            'study_date': str(getattr(ds, 'StudyDate', '')),
+            'study_desc': str(getattr(ds, 'StudyDescription', '')),
+            'series_desc': str(getattr(ds, 'SeriesDescription', '')),
+            'modality': str(getattr(ds, 'Modality', 'OT')),
+            'sop_class_uid': str(ds.SOPClassUID),
+            'sop_instance_uid': str(getattr(ds, 'SOPInstanceUID', '')),
+            'study_instance_uid': str(getattr(ds, 'StudyInstanceUID', '')),
+            'series_instance_uid': str(getattr(ds, 'SeriesInstanceUID', '')),
+            'transfer_syntax': str(getattr(ds.file_meta, 'TransferSyntaxUID', ImplicitVRLittleEndian)) if hasattr(ds, 'file_meta') else str(ImplicitVRLittleEndian),
+            'file_size': Path(filepath).stat().st_size,
+        }
+    except Exception:
+        return None
+
+
+class ScanCache:
+    """SQLite-backed scan cache for incremental scan persistence.
+    Survives crashes — on restart, already-scanned files are loaded instantly.
+    Stored in ~/.dicom_migrator/scan_cache_{folder}.db"""
+
+    def __init__(self, source_folder=None):
+        self.db_path = None
+        self.conn = None
+        if source_folder:
+            self.init_for_folder(source_folder)
+
+    def init_for_folder(self, source_folder):
+        safe = re.sub(r'[^\w\-.]', '_', os.path.basename(source_folder.rstrip('/\\')))
+        cache_dir = os.path.join(os.path.expanduser("~"), ".dicom_migrator")
+        os.makedirs(cache_dir, exist_ok=True)
+        self.db_path = os.path.join(cache_dir, f"scan_cache_{safe}.db")
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent read/write
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS scan_results (
+                path TEXT PRIMARY KEY,
+                patient_name TEXT, patient_id TEXT, study_date TEXT,
+                study_desc TEXT, series_desc TEXT, modality TEXT,
+                sop_class_uid TEXT, sop_instance_uid TEXT,
+                study_instance_uid TEXT, series_instance_uid TEXT,
+                transfer_syntax TEXT, file_size INTEGER,
+                scanned_at TEXT
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS scan_skipped (
+                path TEXT PRIMARY KEY,
+                reason TEXT,
+                scanned_at TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def is_scanned(self, path):
+        """Check if a file path has already been scanned."""
+        if not self.conn:
+            return False
+        row = self.conn.execute("SELECT 1 FROM scan_results WHERE path=? UNION SELECT 1 FROM scan_skipped WHERE path=?",
+                                (str(path), str(path))).fetchone()
+        return row is not None
+
+    def get_cached_result(self, path):
+        """Return cached metadata dict or None."""
+        if not self.conn:
+            return None
+        row = self.conn.execute(
+            "SELECT path,patient_name,patient_id,study_date,study_desc,series_desc,"
+            "modality,sop_class_uid,sop_instance_uid,study_instance_uid,"
+            "series_instance_uid,transfer_syntax,file_size FROM scan_results WHERE path=?",
+            (str(path),)).fetchone()
+        if row:
+            return {
+                'path': row[0], 'patient_name': row[1], 'patient_id': row[2],
+                'study_date': row[3], 'study_desc': row[4], 'series_desc': row[5],
+                'modality': row[6], 'sop_class_uid': row[7], 'sop_instance_uid': row[8],
+                'study_instance_uid': row[9], 'series_instance_uid': row[10],
+                'transfer_syntax': row[11], 'file_size': row[12],
+            }
+        return None
+
+    def store_result(self, meta):
+        """Store a scan result. Expects dict with standard DICOM metadata keys."""
+        if not self.conn:
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_results "
+            "(path,patient_name,patient_id,study_date,study_desc,series_desc,"
+            "modality,sop_class_uid,sop_instance_uid,study_instance_uid,"
+            "series_instance_uid,transfer_syntax,file_size,scanned_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (meta['path'], meta.get('patient_name',''), meta.get('patient_id',''),
+             meta.get('study_date',''), meta.get('study_desc',''), meta.get('series_desc',''),
+             meta.get('modality',''), meta.get('sop_class_uid',''), meta.get('sop_instance_uid',''),
+             meta.get('study_instance_uid',''), meta.get('series_instance_uid',''),
+             meta.get('transfer_syntax',''), meta.get('file_size',0),
+             datetime.now().isoformat()))
+
+    def store_skipped(self, path, reason='non-dicom'):
+        """Mark a file as scanned but not DICOM."""
+        if not self.conn:
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_skipped (path,reason,scanned_at) VALUES (?,?,?)",
+            (str(path), reason, datetime.now().isoformat()))
+
+    def flush(self):
+        """Commit pending writes to disk."""
+        if self.conn:
+            self.conn.commit()
+
+    def load_all_results(self, date_from=None, date_to=None):
+        """Load all cached DICOM results, optionally filtered by date range.
+        Returns list of metadata dicts."""
+        if not self.conn:
+            return []
+        query = "SELECT path,patient_name,patient_id,study_date,study_desc,series_desc," \
+                "modality,sop_class_uid,sop_instance_uid,study_instance_uid," \
+                "series_instance_uid,transfer_syntax,file_size FROM scan_results"
+        params = []
+        clauses = []
+        if date_from:
+            clauses.append("study_date >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("study_date <= ?")
+            params.append(date_to)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        results = []
+        for row in self.conn.execute(query, params):
+            results.append({
+                'path': row[0], 'patient_name': row[1], 'patient_id': row[2],
+                'study_date': row[3], 'study_desc': row[4], 'series_desc': row[5],
+                'modality': row[6], 'sop_class_uid': row[7], 'sop_instance_uid': row[8],
+                'study_instance_uid': row[9], 'series_instance_uid': row[10],
+                'transfer_syntax': row[11], 'file_size': row[12],
+            })
+        return results
+
+    def get_scanned_count(self):
+        """Return total number of cached results (DICOM + skipped)."""
+        if not self.conn:
+            return 0, 0
+        dc = self.conn.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0]
+        sk = self.conn.execute("SELECT COUNT(*) FROM scan_skipped").fetchone()[0]
+        return dc, sk
+
+    def get_scanned_paths_set(self):
+        """Return set of all paths already in cache (for fast lookup during scan)."""
+        if not self.conn:
+            return set()
+        paths = set()
+        for row in self.conn.execute("SELECT path FROM scan_results"):
+            paths.add(row[0])
+        for row in self.conn.execute("SELECT path FROM scan_skipped"):
+            paths.add(row[0])
+        return paths
+
+    def clear(self):
+        """Wipe the scan cache for a fresh rescan."""
+        if self.conn:
+            self.conn.execute("DELETE FROM scan_results")
+            self.conn.execute("DELETE FROM scan_skipped")
+            self.conn.commit()
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
 
 TRANSFER_SYNTAXES = [
     ExplicitVRLittleEndian, ImplicitVRLittleEndian,
@@ -1475,11 +1730,11 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
     return (status_val, msg, was_decompressed, False, new_assoc)
 
 DARK_STYLE = """
-/* ═══ Premium Dark Theme — Catppuccin Mocha Deep ═══ */
+/* ═══ Premium Dark Theme — Catppuccin Mocha Deep v3 ═══ */
 
 /* ─── Base ─── */
-QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }
-QDialog { background-color: #1e1e2e; color: #cdd6f4; }
+QMainWindow { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }
+QDialog { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }
 
 /* ─── Group Boxes ─── */
 QGroupBox { border: 1px solid #313244; border-radius: 10px; margin-top: 1.4em; padding: 16px 12px 12px 12px; color: #cdd6f4; font-weight: 600; background-color: rgba(24, 24, 37, 0.5); }
@@ -1496,6 +1751,24 @@ QPushButton[success="true"] { background-color: #a6e3a1; color: #11111b; }
 QPushButton[success="true"]:hover { background-color: #b8eab5; }
 QPushButton[warning="true"] { background-color: #fab387; color: #11111b; }
 QPushButton[warning="true"]:hover { background-color: #fbc4a0; }
+
+/* ─── Sidebar — Override QPushButton/QWidget bleed ─── */
+SidebarButton {
+    background: transparent; border: none; padding: 0; margin: 0;
+    border-radius: 0; font-weight: normal; font-size: 13px;
+    min-height: 48px; max-height: 48px;
+}
+SidebarButton:hover, SidebarButton:pressed, SidebarButton:checked {
+    background: transparent; border: none;
+}
+SidebarNav, SidebarNav QWidget, SidebarNav QLabel, SidebarNav QFrame {
+    background: transparent; border: none; color: #cdd6f4;
+}
+
+/* ─── Title Bar — Override QWidget bleed ─── */
+FramelessTitleBar, FramelessTitleBar QWidget, FramelessTitleBar QLabel {
+    background: transparent;
+}
 
 /* ─── Inputs ─── */
 QLineEdit, QSpinBox, QDoubleSpinBox, QTimeEdit, QDateEdit {
@@ -1531,13 +1804,6 @@ QTableWidget::item:hover { background-color: rgba(137, 180, 250, 0.06); }
 
 /* ─── Headers ─── */
 QHeaderView::section { background-color: #11111b; color: #7f849c; border: none; border-bottom: 2px solid #1e1e2e; padding: 8px 10px; font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-
-/* ─── Tabs ─── */
-QTabWidget::pane { border: 1px solid #1e1e2e; background: #1e1e2e; border-radius: 8px; top: -1px; }
-QTabBar { padding-left: 8px; }
-QTabBar::tab { background: transparent; color: #585b70; padding: 10px 32px; border: none; border-bottom: 3px solid transparent; font-weight: 700; font-size: 13px; margin-right: 4px; min-width: 90px; }
-QTabBar::tab:selected { color: #89b4fa; border-bottom-color: #89b4fa; background: rgba(137, 180, 250, 0.06); }
-QTabBar::tab:hover:!selected { color: #a6adc8; border-bottom-color: #45475a; }
 
 /* ─── Checkboxes ─── */
 QCheckBox { spacing: 10px; color: #cdd6f4; font-size: 13px; }
@@ -1576,6 +1842,12 @@ QLabel[heading="true"] { font-size: 15px; font-weight: 700; color: #89b4fa; }
 QLabel[subtext="true"] { color: #585b70; font-size: 11px; }
 QLabel[stat="true"] { font-size: 26px; font-weight: 800; color: #cdd6f4; letter-spacing: -0.5px; }
 QFrame[separator="true"] { background-color: #1e1e2e; max-height: 1px; }
+
+/* ─── Scroll Area (transparent pass-through) ─── */
+QScrollArea { background: transparent; border: none; }
+
+/* ─── Page Content Wrapper ─── */
+QStackedWidget { background-color: #1e1e2e; }
 """
 
 
@@ -1834,6 +2106,15 @@ class MigrationManifest:
     def get_failed_count(self):
         return sum(1 for r in self.records.values() if r['status'] == 'failed')
 
+    def close(self):
+        """Flush and close the SQLite database."""
+        if self._db:
+            try:
+                self._db.commit()
+                self._db.close()
+            except Exception: pass
+            self._db = None
+
     def export_csv(self, csv_path):
         fields = ['sop_instance_uid', 'sop_class_uid', 'path', 'status', 'message', 'timestamp',
                    'patient_name', 'patient_id', 'study_date', 'study_desc', 'series_desc', 'modality',
@@ -1896,15 +2177,6 @@ class MigrationManifest:
 
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
-
-    def close(self):
-        """Flush and close the SQLite database."""
-        if self._db:
-            try:
-                self._db.commit()
-                self._db.close()
-            except Exception: pass
-            self._db = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2069,19 +2341,75 @@ class ScannerThread(QThread):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, folder_path, recursive=True, manifest=None):
+    def __init__(self, folder_path, recursive=True, manifest=None,
+                 date_from=None, date_to=None, scan_threads=6):
         super().__init__()
         self.folder_path = folder_path; self.recursive = recursive; self._cancel = False
         self.manifest = manifest
+        self.date_from = date_from  # 'YYYYMMDD' string or None
+        self.date_to = date_to      # 'YYYYMMDD' string or None
+        self.scan_threads = scan_threads
+        self._two_pass = date_from is not None or date_to is not None
 
     def cancel(self): self._cancel = True
 
+    def _pass1_check_file(self, fpath_str):
+        """Pass 1 worker: magic byte check + quick StudyDate read.
+        Returns (path, study_date_str) or (path, None) if not DICOM / out of range."""
+        fpath = Path(fpath_str)
+        # Extension pre-filter
+        if _should_skip_extension(fpath):
+            return (fpath_str, None, 'skip_ext')
+        # Magic byte check (fast 132-byte read)
+        magic = _has_dicom_magic(fpath)
+        if magic is False:
+            # No magic byte — could still be non-conformant DICOM, try quick read anyway
+            sd = _quick_read_study_date(fpath)
+            if sd is None:
+                return (fpath_str, None, 'not_dicom')
+            return (fpath_str, sd, 'ok')
+        elif magic is None:
+            return (fpath_str, None, 'read_error')
+        # Has magic byte — read StudyDate
+        sd = _quick_read_study_date(fpath)
+        if sd is None:
+            return (fpath_str, None, 'no_date')
+        return (fpath_str, sd, 'ok')
+
+    def _pass2_read_metadata(self, fpath_str):
+        """Pass 2 worker: full targeted metadata extraction."""
+        return _read_dicom_metadata(fpath_str)
+
+    def _single_pass_read(self, fpath_str):
+        """Single-pass worker (no date filter): extension + magic + full metadata."""
+        fpath = Path(fpath_str)
+        if _should_skip_extension(fpath):
+            return None
+        magic = _has_dicom_magic(fpath)
+        if magic is False:
+            # No magic — try anyway for non-conformant DICOM
+            return _read_dicom_metadata(fpath)
+        elif magic is None:
+            return None
+        return _read_dicom_metadata(fpath)
+
     def run(self):
+        scan_cache = None
         try:
             results = []
             self.log.emit(f"Scanning (READ-ONLY): {self.folder_path}")
-            self.status.emit("Enumerating files...")
+            if self._two_pass:
+                self.log.emit(f"Two-pass mode: date filter {self.date_from or 'any'} to {self.date_to or 'any'}")
+            self.log.emit(f"Parallel scan threads: {self.scan_threads}")
+            self.status.emit("Initializing scan cache...")
             root = Path(self.folder_path)
+
+            # Initialize SQLite scan cache for incremental persistence
+            scan_cache = ScanCache(self.folder_path)
+            cached_paths = scan_cache.get_scanned_paths_set()
+            cached_dc, cached_sk = scan_cache.get_scanned_count()
+            if cached_dc or cached_sk:
+                self.log.emit(f"Scan cache: {cached_dc:,} DICOM + {cached_sk:,} skipped already cached")
 
             # Build path-based cache from manifest for instant metadata lookup
             _manifest_cache = {}  # path -> record dict
@@ -2107,75 +2435,291 @@ class ScannerThread(QThread):
                 if _manifest_cache:
                     self.log.emit(f"Manifest cache: {len(_manifest_cache):,} files with cached metadata (instant scan)")
 
-            # Use os.walk instead of glob — yields incrementally on large stores
+            # ── Stream-as-you-walk file enumeration ──
+            self.status.emit("Enumerating files...")
             all_files = []
             dir_count = 0
             for dirpath, dirnames, filenames in os.walk(str(root)):
                 if self._cancel: self.finished.emit(results); return
                 dir_count += 1
                 for fname in filenames:
-                    all_files.append(Path(dirpath) / fname)
+                    all_files.append(str(Path(dirpath) / fname))
                 if dir_count % 50 == 0:
                     self.status.emit(f"Enumerating: {len(all_files):,} files in {dir_count:,} folders...")
                     self.current_file.emit(f"Scanning folder: {os.path.basename(dirpath)}", 0, 0)
                 if not self.recursive:
-                    break  # only top-level folder
+                    break
 
             total = len(all_files)
-            self.log.emit(f"Found {total:,} files in {dir_count:,} folders, reading DICOM headers...")
-            dc = sk = cached = 0
-            for i, fpath in enumerate(all_files):
+            self.log.emit(f"Found {total:,} files in {dir_count:,} folders")
+            dc = sk = from_cache = from_manifest = 0
+            _cache_batch = 0  # Counter for periodic SQLite flush
+
+            if self._two_pass:
+                # ═══════════════════════════════════════════════
+                # TWO-PASS SCAN: fast date filter then full parse
+                # ═══════════════════════════════════════════════
+                self.log.emit("Pass 1: Quick StudyDate extraction with threaded I/O...")
+                pass1_hits = []  # Files within date range
+                pass1_done = 0
+
+                # Separate files into: already cached, manifest cached, need scanning
+                need_pass1 = []
+                for fpath_str in all_files:
+                    if self._cancel: break
+                    # Check manifest cache first
+                    if fpath_str in _manifest_cache:
+                        rec = _manifest_cache[fpath_str]
+                        sd = rec.get('study_date', '')
+                        in_range = True
+                        if sd and self.date_from and sd < self.date_from:
+                            in_range = False
+                        if sd and self.date_to and sd > self.date_to:
+                            in_range = False
+                        if in_range:
+                            try: rec['file_size'] = Path(fpath_str).stat().st_size
+                            except: pass
+                            results.append(rec)
+                            dc += 1; from_manifest += 1
+                        else:
+                            sk += 1
+                        pass1_done += 1
+                        continue
+                    # Check SQLite scan cache
+                    if fpath_str in cached_paths:
+                        cached_rec = scan_cache.get_cached_result(fpath_str)
+                        if cached_rec:
+                            sd = cached_rec.get('study_date', '')
+                            in_range = True
+                            if sd and self.date_from and sd < self.date_from:
+                                in_range = False
+                            if sd and self.date_to and sd > self.date_to:
+                                in_range = False
+                            if in_range:
+                                results.append(cached_rec)
+                                dc += 1; from_cache += 1
+                            else:
+                                sk += 1
+                        else:
+                            sk += 1  # Was in skipped table
+                        pass1_done += 1
+                        continue
+                    # Extension pre-filter (instant, no I/O)
+                    if _should_skip_extension(fpath_str):
+                        scan_cache.store_skipped(fpath_str, 'extension')
+                        sk += 1; pass1_done += 1
+                        _cache_batch += 1
+                        if _cache_batch >= 5000:
+                            scan_cache.flush(); _cache_batch = 0
+                        continue
+                    need_pass1.append(fpath_str)
+
                 if self._cancel: self.finished.emit(results); return
-                self.progress.emit(i + 1, total)
-                # Emit current file for live display
-                try:
-                    rel = fpath.relative_to(root)
-                except ValueError:
-                    rel = fpath.name
 
-                # Fast path: use cached metadata from manifest instead of reading DICOM header
-                fpath_str = str(fpath)
-                if fpath_str in _manifest_cache:
-                    rec = _manifest_cache[fpath_str]
-                    # Get actual file size (cheap stat vs expensive dcmread)
-                    try: rec['file_size'] = fpath.stat().st_size
-                    except: pass
-                    results.append(rec)
-                    dc += 1; cached += 1
-                    if (i + 1) % 5000 == 0:
-                        self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM ({cached:,} cached) | {sk:,} skipped")
-                        self.current_file.emit(f"Fast-cached: {rel}", dc, sk)
-                    continue
+                self.log.emit(f"Pass 1: {len(need_pass1):,} files need date check ({from_cache + from_manifest:,} from cache)")
+                self.status.emit(f"Pass 1: Checking dates on {len(need_pass1):,} files...")
 
-                self.current_file.emit(str(rel), dc, sk)
-                if (i + 1) % 100 == 0:
-                    self.status.emit(f"Scanning {i+1:,}/{total:,} | {dc:,} DICOM ({cached:,} cached) | {sk:,} skipped")
-                try:
-                    ds = pydicom.dcmread(str(fpath), stop_before_pixels=True, force=True)
-                    if not hasattr(ds, 'SOPClassUID'): sk += 1; continue
-                    results.append({
-                        'path': str(fpath),
-                        'patient_name': str(getattr(ds, 'PatientName', 'Unknown')),
-                        'patient_id': str(getattr(ds, 'PatientID', 'N/A')),
-                        'study_date': str(getattr(ds, 'StudyDate', '')),
-                        'study_desc': str(getattr(ds, 'StudyDescription', '')),
-                        'series_desc': str(getattr(ds, 'SeriesDescription', '')),
-                        'modality': str(getattr(ds, 'Modality', 'OT')),
-                        'sop_class_uid': str(ds.SOPClassUID),
-                        'sop_instance_uid': str(getattr(ds, 'SOPInstanceUID', '')),
-                        'study_instance_uid': str(getattr(ds, 'StudyInstanceUID', '')),
-                        'series_instance_uid': str(getattr(ds, 'SeriesInstanceUID', '')),
-                        'transfer_syntax': str(getattr(ds.file_meta, 'TransferSyntaxUID', ImplicitVRLittleEndian)) if hasattr(ds, 'file_meta') else str(ImplicitVRLittleEndian),
-                        'file_size': fpath.stat().st_size,
-                    })
-                    dc += 1
-                    if dc % 1000 == 0: self.log.emit(f"  {dc:,} DICOM files parsed...")
-                except: sk += 1
-            cache_msg = f" ({cached:,} from manifest cache)" if cached else ""
-            self.log.emit(f"Scan complete: {dc:,} DICOM{cache_msg}, {sk:,} skipped (all read-only)")
+                # Threaded Pass 1 — quick StudyDate reads
+                with ThreadPoolExecutor(max_workers=self.scan_threads) as executor:
+                    futures = {executor.submit(self._pass1_check_file, fp): fp for fp in need_pass1}
+                    for future in as_completed(futures):
+                        if self._cancel:
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                executor.shutdown(wait=False)  # Python 3.8 compat
+                            self.finished.emit(results); return
+                        pass1_done += 1
+                        self.progress.emit(pass1_done, total)
+                        try:
+                            fpath_str, study_date, status = future.result()
+                        except Exception:
+                            sk += 1; continue
+
+                        if status in ('skip_ext', 'not_dicom', 'read_error'):
+                            scan_cache.store_skipped(fpath_str, status)
+                            sk += 1
+                        elif status == 'no_date':
+                            # Has DICOM magic but no StudyDate — include by default (undated studies)
+                            pass1_hits.append(fpath_str)
+                        elif status == 'ok' and study_date:
+                            in_range = True
+                            if self.date_from and study_date < self.date_from:
+                                in_range = False
+                            if self.date_to and study_date > self.date_to:
+                                in_range = False
+                            if in_range:
+                                pass1_hits.append(fpath_str)
+                            else:
+                                # Do NOT cache date-filtered files as skipped — the date range
+                                # is a scan-time parameter, not an inherent file property.
+                                # A future scan with a wider range must re-evaluate these files.
+                                sk += 1
+                        else:
+                            sk += 1
+
+                        _cache_batch += 1
+                        if _cache_batch >= 5000:
+                            scan_cache.flush(); _cache_batch = 0
+
+                        if pass1_done % 5000 == 0:
+                            self.status.emit(f"Pass 1: {pass1_done:,}/{total:,} | {len(pass1_hits):,} in range | {sk:,} filtered")
+                            try:
+                                rel = Path(fpath_str).relative_to(root)
+                            except ValueError:
+                                rel = Path(fpath_str).name
+                            self.current_file.emit(str(rel), dc + len(pass1_hits), sk)
+
+                scan_cache.flush()
+                if self._cancel: self.finished.emit(results); return
+
+                pct_filtered = ((total - len(pass1_hits) - dc) / total * 100) if total > 0 else 0
+                self.log.emit(f"Pass 1 complete: {len(pass1_hits):,} files in date range, "
+                              f"{sk:,} filtered out ({pct_filtered:.0f}% eliminated)")
+
+                # ── Pass 2: Full metadata on date-filtered files ──
+                if pass1_hits:
+                    self.log.emit(f"Pass 2: Full metadata extraction on {len(pass1_hits):,} files...")
+                    self.status.emit(f"Pass 2: Reading metadata from {len(pass1_hits):,} files...")
+                    pass2_done = 0
+                    pass2_total = len(pass1_hits)
+
+                    with ThreadPoolExecutor(max_workers=self.scan_threads) as executor:
+                        futures = {executor.submit(self._pass2_read_metadata, fp): fp for fp in pass1_hits}
+                        for future in as_completed(futures):
+                            if self._cancel:
+                                try:
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                except TypeError:
+                                    executor.shutdown(wait=False)
+                                self.finished.emit(results); return
+                            pass2_done += 1
+                            self.progress.emit(pass1_done + pass2_done, total + pass2_total)
+                            try:
+                                meta = future.result()
+                            except Exception:
+                                sk += 1; continue
+                            if meta:
+                                results.append(meta)
+                                scan_cache.store_result(meta)
+                                dc += 1
+                                _cache_batch += 1
+                                if _cache_batch >= 5000:
+                                    scan_cache.flush(); _cache_batch = 0
+                            else:
+                                sk += 1
+
+                            if pass2_done % 2000 == 0:
+                                self.status.emit(f"Pass 2: {pass2_done:,}/{pass2_total:,} | {dc:,} DICOM")
+                                try:
+                                    rel = Path(futures[future]).relative_to(root)
+                                except (ValueError, KeyError):
+                                    rel = "..."
+                                self.current_file.emit(str(rel), dc, sk)
+
+                    scan_cache.flush()
+            else:
+                # ═══════════════════════════════════════════════
+                # SINGLE-PASS SCAN: no date pre-filter
+                # ═══════════════════════════════════════════════
+                self.log.emit("Single-pass scan with threaded I/O + magic byte check...")
+
+                # Separate into cached vs need-scan
+                need_scan = []
+                for fpath_str in all_files:
+                    if self._cancel: break
+                    # Manifest cache (instant)
+                    if fpath_str in _manifest_cache:
+                        rec = _manifest_cache[fpath_str]
+                        try: rec['file_size'] = Path(fpath_str).stat().st_size
+                        except: pass
+                        results.append(rec)
+                        dc += 1; from_manifest += 1
+                        continue
+                    # SQLite scan cache
+                    if fpath_str in cached_paths:
+                        cached_rec = scan_cache.get_cached_result(fpath_str)
+                        if cached_rec:
+                            results.append(cached_rec)
+                            dc += 1; from_cache += 1
+                        else:
+                            sk += 1
+                        continue
+                    # Extension pre-filter
+                    if _should_skip_extension(fpath_str):
+                        scan_cache.store_skipped(fpath_str, 'extension')
+                        sk += 1
+                        _cache_batch += 1
+                        if _cache_batch >= 5000:
+                            scan_cache.flush(); _cache_batch = 0
+                        continue
+                    need_scan.append(fpath_str)
+
+                if self._cancel: self.finished.emit(results); return
+
+                self.log.emit(f"Need to scan: {len(need_scan):,} files ({from_cache + from_manifest:,} from cache)")
+
+                # Threaded single-pass scan
+                scan_done = dc + sk + from_cache + from_manifest
+                with ThreadPoolExecutor(max_workers=self.scan_threads) as executor:
+                    futures = {executor.submit(self._single_pass_read, fp): fp for fp in need_scan}
+                    for future in as_completed(futures):
+                        if self._cancel:
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                executor.shutdown(wait=False)
+                            self.finished.emit(results); return
+                        scan_done += 1
+                        self.progress.emit(scan_done, total)
+                        fpath_str = futures[future]
+                        try:
+                            meta = future.result()
+                        except Exception:
+                            scan_cache.store_skipped(fpath_str, 'error')
+                            sk += 1; continue
+                        if meta:
+                            results.append(meta)
+                            scan_cache.store_result(meta)
+                            dc += 1
+                            if dc % 1000 == 0:
+                                self.log.emit(f"  {dc:,} DICOM files parsed...")
+                        else:
+                            scan_cache.store_skipped(fpath_str, 'not_dicom')
+                            sk += 1
+
+                        _cache_batch += 1
+                        if _cache_batch >= 5000:
+                            scan_cache.flush(); _cache_batch = 0
+
+                        if scan_done % 5000 == 0:
+                            self.status.emit(f"Scanning {scan_done:,}/{total:,} | {dc:,} DICOM | {sk:,} skipped")
+                            try:
+                                rel = Path(fpath_str).relative_to(root)
+                            except ValueError:
+                                rel = Path(fpath_str).name
+                            self.current_file.emit(str(rel), dc, sk)
+
+                scan_cache.flush()
+
+            # Final summary
+            cache_parts = []
+            if from_manifest: cache_parts.append(f"{from_manifest:,} manifest")
+            if from_cache: cache_parts.append(f"{from_cache:,} scan cache")
+            cache_msg = f" ({', '.join(cache_parts)})" if cache_parts else ""
+            date_msg = ""
+            if self._two_pass:
+                date_msg = f" | Date filter: {self.date_from or '*'} to {self.date_to or '*'}"
+            self.log.emit(f"Scan complete: {dc:,} DICOM{cache_msg}, {sk:,} skipped{date_msg} (all read-only)")
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(f"Scan failed: {e}\n{traceback.format_exc()}")
+        finally:
+            if scan_cache:
+                try:
+                    scan_cache.close()
+                except Exception:
+                    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2444,10 +2988,7 @@ class UploadThread(QThread):
     def resume(self): self._paused = False; self._pause_event.set()
 
     def update_live_settings(self, **kwargs):
-        """Push setting changes to the running thread. Called from GUI thread.
-        Supported keys: decompress_fallback, conflict_retry, conflict_suffix,
-        batch_size, throttle_rate, adaptive_enabled, tod_enabled, tod_peak_delay,
-        tod_peak_workers, tod_peak_start, tod_peak_end."""
+        """Push setting changes to the running thread. Called from GUI thread."""
         for key, val in kwargs.items():
             if key in ('decompress_fallback', 'conflict_retry', 'conflict_suffix', 'batch_size'):
                 self._live_config[key] = val
@@ -4727,6 +5268,494 @@ class ConnectionAssistantDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Premium UI Components — Sidebar Navigation & Frameless Title Bar
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _IconPainter:
+    """Draw crisp vector icons for sidebar buttons using QPainter."""
+
+    @staticmethod
+    def draw(painter, rect, icon_name, color):
+        """Draw an icon centered in rect."""
+        p = painter
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(color), 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        cx, cy = rect.center().x(), rect.center().y()
+        s = min(rect.width(), rect.height()) * 0.38  # icon size
+
+        if icon_name == "config":
+            # Gear icon
+            p.setPen(QPen(QColor(color), 1.6, Qt.SolidLine, Qt.RoundCap))
+            outer = s * 0.95
+            inner = s * 0.55
+            import math
+            teeth = 8
+            path = QPainterPath()
+            for i in range(teeth * 2):
+                angle = math.radians(i * 360 / (teeth * 2))
+                r = outer if i % 2 == 0 else inner * 1.15
+                x = cx + r * math.cos(angle)
+                y = cy + r * math.sin(angle)
+                if i == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            path.closeSubpath()
+            p.drawPath(path)
+            p.drawEllipse(QRectF(cx - inner * 0.5, cy - inner * 0.5, inner, inner))
+
+        elif icon_name == "browser":
+            # Folder icon
+            l, t = cx - s * 0.8, cy - s * 0.55
+            w, h = s * 1.6, s * 1.15
+            tab_w = w * 0.35
+            path = QPainterPath()
+            r = 3.0
+            path.moveTo(l + r, t + s * 0.3)
+            path.lineTo(l + r, t + r)
+            path.quadTo(l, t, l + r, t)
+            path.lineTo(l + tab_w - r, t)
+            path.lineTo(l + tab_w + s * 0.1, t + s * 0.3)
+            path.lineTo(l + w - r, t + s * 0.3)
+            path.quadTo(l + w, t + s * 0.3, l + w, t + s * 0.3 + r)
+            path.lineTo(l + w, t + h - r)
+            path.quadTo(l + w, t + h, l + w - r, t + h)
+            path.lineTo(l + r, t + h)
+            path.quadTo(l, t + h, l, t + h - r)
+            path.lineTo(l, t + s * 0.3 + r)
+            path.quadTo(l, t + s * 0.3, l + r, t + s * 0.3)
+            path.closeSubpath()
+            p.drawPath(path)
+
+        elif icon_name == "upload":
+            # Upload arrow with base line
+            p.setPen(QPen(QColor(color), 2.0, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(int(cx), int(cy - s * 0.75), int(cx), int(cy + s * 0.45))
+            # Arrow head
+            p.drawLine(int(cx), int(cy - s * 0.75), int(cx - s * 0.4), int(cy - s * 0.3))
+            p.drawLine(int(cx), int(cy - s * 0.75), int(cx + s * 0.4), int(cy - s * 0.3))
+            # Base tray
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.7, cy + s * 0.2)
+            path.lineTo(cx - s * 0.7, cy + s * 0.7)
+            path.lineTo(cx + s * 0.7, cy + s * 0.7)
+            path.lineTo(cx + s * 0.7, cy + s * 0.2)
+            p.drawPath(path)
+
+        elif icon_name == "verify":
+            # Shield with checkmark
+            path = QPainterPath()
+            path.moveTo(cx, cy - s * 0.85)
+            path.lineTo(cx + s * 0.65, cy - s * 0.45)
+            path.quadTo(cx + s * 0.7, cy + s * 0.35, cx, cy + s * 0.85)
+            path.quadTo(cx - s * 0.7, cy + s * 0.35, cx - s * 0.65, cy - s * 0.45)
+            path.closeSubpath()
+            p.drawPath(path)
+            # Checkmark inside
+            p.setPen(QPen(QColor(color), 2.0, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(int(cx - s * 0.25), int(cy + s * 0.05), int(cx - s * 0.02), int(cy + s * 0.3))
+            p.drawLine(int(cx - s * 0.02), int(cy + s * 0.3), int(cx + s * 0.3), int(cy - s * 0.2))
+
+        elif icon_name == "dashboard":
+            # Bar chart
+            bar_w = s * 0.3
+            gap = s * 0.12
+            bars = [0.5, 0.85, 0.65, 0.95]
+            total_w = len(bars) * bar_w + (len(bars) - 1) * gap
+            start_x = cx - total_w / 2
+            base_y = cy + s * 0.65
+            for i, h_frac in enumerate(bars):
+                bx = start_x + i * (bar_w + gap)
+                bh = s * 1.3 * h_frac
+                r = QRectF(bx, base_y - bh, bar_w, bh)
+                path = QPainterPath()
+                path.addRoundedRect(r, 2, 2)
+                p.drawPath(path)
+
+        elif icon_name == "log":
+            # Document with lines
+            l, t = cx - s * 0.55, cy - s * 0.75
+            w, h = s * 1.1, s * 1.5
+            r = 3.0
+            p.drawRoundedRect(QRectF(l, t, w, h), r, r)
+            # Lines
+            p.setPen(QPen(QColor(color), 1.2))
+            line_y_start = t + h * 0.25
+            for i in range(3):
+                ly = line_y_start + i * h * 0.2
+                lw = w * (0.65 if i < 2 else 0.4)
+                p.drawLine(int(l + w * 0.18), int(ly), int(l + w * 0.18 + lw), int(ly))
+
+        elif icon_name == "collapse":
+            # Hamburger / collapse icon
+            p.setPen(QPen(QColor(color), 2.0, Qt.SolidLine, Qt.RoundCap))
+            for i, frac in enumerate([-0.35, 0.0, 0.35]):
+                y = int(cy + s * frac)
+                p.drawLine(int(cx - s * 0.5), y, int(cx + s * 0.5), y)
+
+        p.restore()
+
+
+class SidebarButton(QPushButton):
+    """Animated sidebar navigation button with painted icon."""
+
+    def __init__(self, icon_name, label, parent=None):
+        super().__init__(parent)
+        self._icon_name = icon_name
+        self._label = label
+        self._is_active = False
+        self._hover_progress = 0.0  # 0.0 to 1.0
+        self._expanded = True
+        self._indicator_anim = QPropertyAnimation(self, b"minimumHeight")  # dummy target for timer
+        self.setCheckable(True)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setToolTip(label)
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(16)
+        self._hover_timer.timeout.connect(self._animate_hover)
+        self._hover_target = 0.0
+        self.setMinimumHeight(48)
+        self.setMaximumHeight(48)
+
+    def set_expanded(self, expanded):
+        self._expanded = expanded
+        self.setMinimumWidth(200 if expanded else 56)
+        self.setMaximumWidth(200 if expanded else 56)
+        self.update()
+
+    def set_active(self, active):
+        self._is_active = active
+        self.setChecked(active)
+        self.update()
+
+    def enterEvent(self, event):
+        self._hover_target = 1.0
+        if not self._hover_timer.isActive():
+            self._hover_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_target = 0.0
+        if not self._hover_timer.isActive():
+            self._hover_timer.start()
+        super().leaveEvent(event)
+
+    def _animate_hover(self):
+        diff = self._hover_target - self._hover_progress
+        if abs(diff) < 0.02:
+            self._hover_progress = self._hover_target
+            self._hover_timer.stop()
+        else:
+            self._hover_progress += diff * 0.25
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        if self._is_active:
+            bg = QColor("#89b4fa")
+            bg.setAlpha(25)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(bg))
+            p.drawRoundedRect(QRectF(4, 2, w - 8, h - 4), 8, 8)
+            # Active indicator bar
+            p.setBrush(QBrush(QColor("#89b4fa")))
+            p.drawRoundedRect(QRectF(0, h * 0.2, 3, h * 0.6), 1.5, 1.5)
+        elif self._hover_progress > 0.01:
+            bg = QColor("#cdd6f4")
+            bg.setAlpha(int(8 * self._hover_progress))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(bg))
+            p.drawRoundedRect(QRectF(4, 2, w - 8, h - 4), 8, 8)
+
+        # Icon
+        icon_rect = QRectF(8, 0, 48, h) if self._expanded else QRectF(0, 0, w, h)
+        icon_color = "#89b4fa" if self._is_active else ("#cdd6f4" if self._hover_progress > 0.3 else "#7f849c")
+        _IconPainter.draw(p, icon_rect, self._icon_name, icon_color)
+
+        # Label text (only when expanded)
+        if self._expanded:
+            text_color = QColor("#89b4fa" if self._is_active else "#cdd6f4")
+            p.setPen(text_color)
+            f = p.font()
+            f.setFamily("Segoe UI")
+            f.setPixelSize(13)
+            f.setBold(self._is_active)
+            p.setFont(f)
+            text_rect = QRectF(56, 0, w - 64, h)
+            p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, self._label)
+
+        p.end()
+
+
+class SidebarNav(QWidget):
+    """Premium collapsible sidebar navigation."""
+    page_changed = pyqtSignal(int)
+
+    EXPANDED_WIDTH = 200
+    COLLAPSED_WIDTH = 56
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = True
+        self._buttons = []
+        self._current_index = 0
+        self.setFixedWidth(self.EXPANDED_WIDTH)
+        self._build_ui()
+
+    def _build_ui(self):
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 8, 0, 8)
+        self._layout.setSpacing(2)
+
+        # App icon area
+        self._logo_widget = QWidget()
+        self._logo_widget.setFixedHeight(64)
+        self._logo_widget.setStyleSheet("background: transparent;")
+        logo_layout = QHBoxLayout(self._logo_widget)
+        logo_layout.setContentsMargins(8, 4, 8, 4)
+        self._logo_label = QLabel()
+        logo_pm = _load_pixmap(_LOGO_B64, size=(36, 36))
+        if not logo_pm.isNull():
+            self._logo_label.setPixmap(logo_pm)
+        self._logo_label.setFixedSize(40, 40)
+        self._logo_label.setStyleSheet("background: transparent;")
+        logo_layout.addWidget(self._logo_label)
+        self._brand_label = QLabel("DICOM\nMigrator")
+        self._brand_label.setStyleSheet(
+            "font-size: 13px; font-weight: 800; color: #89b4fa; "
+            "background: transparent; letter-spacing: -0.3px; line-height: 1.1;")
+        logo_layout.addWidget(self._brand_label, 1)
+        self._layout.addWidget(self._logo_widget)
+
+        # Separator
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background-color: #313244; margin: 4px 12px;")
+        self._layout.addWidget(sep)
+
+        # Nav buttons container
+        self._btn_container = QVBoxLayout()
+        self._btn_container.setSpacing(2)
+        self._btn_container.setContentsMargins(4, 4, 4, 4)
+        self._layout.addLayout(self._btn_container)
+
+        self._layout.addStretch()
+
+        # Bottom separator
+        sep2 = QFrame()
+        sep2.setFixedHeight(1)
+        sep2.setStyleSheet("background-color: #313244; margin: 4px 12px;")
+        self._layout.addWidget(sep2)
+
+        # Collapse toggle
+        self._collapse_btn = SidebarButton("collapse", "Collapse")
+        self._collapse_btn.set_expanded(self._expanded)
+        self._collapse_btn.clicked.connect(self.toggle_expanded)
+        self._layout.addWidget(self._collapse_btn)
+
+        # Version label
+        self._version_label = QLabel(f"v{VERSION}")
+        self._version_label.setStyleSheet("color: #45475a; font-size: 10px; background: transparent; padding: 2px 0;")
+        self._version_label.setAlignment(Qt.AlignCenter)
+        self._layout.addWidget(self._version_label)
+
+    def add_page(self, icon_name, label):
+        btn = SidebarButton(icon_name, label)
+        btn.set_expanded(self._expanded)
+        idx = len(self._buttons)
+        btn.clicked.connect(lambda checked, i=idx: self._on_button_clicked(i))
+        self._buttons.append(btn)
+        self._btn_container.addWidget(btn)
+        if idx == 0:
+            btn.set_active(True)
+        return idx
+
+    def _on_button_clicked(self, index):
+        if index == self._current_index:
+            return
+        for i, btn in enumerate(self._buttons):
+            btn.set_active(i == index)
+        self._current_index = index
+        self.page_changed.emit(index)
+
+    def set_current_index(self, index):
+        if 0 <= index < len(self._buttons):
+            self._on_button_clicked(index)
+
+    def toggle_expanded(self):
+        self._expanded = not self._expanded
+        target_w = self.EXPANDED_WIDTH if self._expanded else self.COLLAPSED_WIDTH
+
+        anim = QPropertyAnimation(self, b"fixedWidth")
+        anim.setDuration(200)
+        anim.setStartValue(self.width())
+        anim.setEndValue(target_w)
+        anim.setEasingCurve(QEasingCurve.InOutCubic)
+        anim.start()
+        self._width_anim = anim  # prevent GC
+
+        for btn in self._buttons:
+            btn.set_expanded(self._expanded)
+        self._collapse_btn.set_expanded(self._expanded)
+        self._collapse_btn._label = "Collapse" if self._expanded else "Expand"
+        self._collapse_btn.setToolTip(self._collapse_btn._label)
+        self._brand_label.setVisible(self._expanded)
+        self._version_label.setVisible(self._expanded)
+        self.update()
+
+    # pyqtProperty for QPropertyAnimation
+    def _get_fixed_width(self):
+        return self.maximumWidth()
+
+    def _set_fixed_width(self, w):
+        self.setFixedWidth(int(w))
+
+    fixedWidth = pyqtProperty(int, fget=_get_fixed_width, fset=_set_fixed_width)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Sidebar background with subtle gradient
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor("#151520"))
+        grad.setColorAt(0.5, QColor("#13131d"))
+        grad.setColorAt(1.0, QColor("#111119"))
+        p.fillRect(self.rect(), grad)
+
+        # Right edge line
+        p.setPen(QPen(QColor("#1e1e2e"), 1))
+        p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+        p.end()
+
+
+class FramelessTitleBar(QWidget):
+    """Custom frameless title bar with drag support and window controls."""
+    minimize_clicked = pyqtSignal()
+    maximize_clicked = pyqtSignal()
+    close_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(38)
+        self._drag_pos = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 4, 0)
+        layout.setSpacing(0)
+
+        # Title
+        self._title = QLabel(f"{APP_NAME} v{VERSION}")
+        self._title.setStyleSheet(
+            "color: #585b70; font-size: 12px; font-weight: 600; "
+            "background: transparent; letter-spacing: 0.3px;")
+        layout.addWidget(self._title)
+        layout.addStretch()
+
+        # Status badges (compact)
+        safety = QLabel("COPY-ONLY")
+        safety.setStyleSheet(
+            "background-color: rgba(166, 227, 161, 0.10); color: #a6e3a1; "
+            "padding: 3px 10px; border-radius: 4px; font-weight: 700; "
+            "font-size: 10px; border: 1px solid rgba(166, 227, 161, 0.2);")
+        layout.addWidget(safety)
+        layout.addSpacing(6)
+
+        phi = QLabel("PHI PROTECTED")
+        phi.setStyleSheet(
+            "background-color: rgba(137, 180, 250, 0.10); color: #89b4fa; "
+            "padding: 3px 10px; border-radius: 4px; font-weight: 700; "
+            "font-size: 10px; border: 1px solid rgba(137, 180, 250, 0.2);")
+        layout.addWidget(phi)
+        layout.addSpacing(16)
+
+        # Compact app menu button (replaces traditional menu bar)
+        self._menu_btn = QPushButton("\u2630")
+        self._menu_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; border: none; border-radius: 4px;
+                color: #7f849c; font-size: 16px; padding: 0;
+                min-width: 36px; max-width: 36px; min-height: 30px; max-height: 30px;
+            }
+            QPushButton:hover { background-color: rgba(205,214,244,0.08); color: #cdd6f4; }
+        """)
+        self._menu_btn.setToolTip("Menu")
+        layout.addWidget(self._menu_btn)
+        layout.addSpacing(4)
+
+        # Window control buttons
+        btn_style = """
+            QPushButton {{
+                background: transparent; border: none; border-radius: 4px;
+                color: {color}; font-size: 16px; font-family: 'Segoe MDL2 Assets', 'Segoe UI';
+                padding: 0; min-width: 40px; max-width: 40px; min-height: 30px; max-height: 30px;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+        """
+        for symbol, slot, color, hover in [
+            ("\u2500", "minimize_clicked", "#7f849c", "rgba(205,214,244,0.08)"),
+            ("\u25A1", "maximize_clicked", "#7f849c", "rgba(205,214,244,0.08)"),
+            ("\u2715", "close_clicked", "#f38ba8", "rgba(243,139,168,0.15)")
+        ]:
+            btn = QPushButton(symbol)
+            btn.setStyleSheet(btn_style.format(color=color, hover=hover))
+            btn.clicked.connect(getattr(self, slot))
+            layout.addWidget(btn)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.window().frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() == Qt.LeftButton:
+            self.window().move(event.globalPos() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+
+    def mouseDoubleClickEvent(self, event):
+        self.maximize_clicked.emit()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        # Title bar background
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        grad.setColorAt(0.0, QColor("#111119"))
+        grad.setColorAt(0.5, QColor("#141420"))
+        grad.setColorAt(1.0, QColor("#111119"))
+        p.fillRect(self.rect(), grad)
+        # Bottom border
+        p.setPen(QPen(QColor("#1e1e2e"), 1))
+        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        p.end()
+
+
+class GlassCard(QGroupBox):
+    """Glassmorphic styled group box with drop shadow."""
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 4)
+        self.setGraphicsEffect(shadow)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main Window
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
@@ -4734,8 +5763,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.setWindowIcon(_load_icon(_ICON_B64))
-        self.setMinimumSize(1100, 750); self.resize(1280, 850)
+        # Frameless window
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setMinimumSize(1100, 750); self.resize(1380, 900)
         self.setAcceptDrops(True)
+        self._resize_margin = 6
+        self._resize_dragging = False
+        self._resize_edge = None
+        self._really_quit = False
         self.settings = QSettings("DICOMMigrator", "DICOMMigrator")
         self.dicom_files = []; self._file_meta_lookup = {}; self._file_meta_by_sop = {}; self.manifest = MigrationManifest()
         self._audit_logger = AuditLogger(None); self._scan_report = None; self._ts_probe_result = None
@@ -4755,72 +5791,178 @@ class MainWindow(QMainWindow):
         self._scheduled_start_timer = None
         self._remote_monitor = None
         self._original_title = f"{APP_NAME} v{VERSION}"
-        self._build_ui(); self._build_menu_bar(); self._setup_tray(); self._load_settings()
+        self._build_ui(); self._apply_glass_effects(); self._build_menu_bar(); self._setup_tray(); self._load_settings()
         self._connect_live_settings()
 
     def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central)
-        ml = QVBoxLayout(central); ml.setContentsMargins(16, 12, 16, 8); ml.setSpacing(10)
+        root = QVBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
 
-        # ── Premium Header ──
-        header_frame = QFrame()
-        header_frame.setStyleSheet("""
-            QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 #11111b, stop:0.5 #181825, stop:1 #11111b);
-                border-radius: 12px; border: 1px solid #1e1e2e; }
-        """)
-        header_layout = QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(20, 12, 20, 12)
+        # ── Frameless Title Bar ──
+        self._title_bar = FramelessTitleBar(self)
+        self._title_bar.minimize_clicked.connect(self.showMinimized)
+        self._title_bar.maximize_clicked.connect(self._toggle_maximize)
+        self._title_bar.close_clicked.connect(self.close)
+        root.addWidget(self._title_bar)
 
-        # App branding
-        logo_label = QLabel()
-        logo_pm = _load_pixmap(_LOGO_B64, size=(48, 48))
-        if not logo_pm.isNull():
-            logo_label.setPixmap(logo_pm)
-        logo_label.setFixedSize(52, 52)
-        logo_label.setStyleSheet("background: transparent; padding: 2px;")
-        header_layout.addWidget(logo_label)
+        # ── Main Content: Sidebar + Page Stack ──
+        content = QHBoxLayout(); content.setContentsMargins(0, 0, 0, 0); content.setSpacing(0)
 
-        title_col = QVBoxLayout(); title_col.setSpacing(2)
-        t = QLabel("DICOM PACS Migrator")
-        t.setStyleSheet("font-size: 20px; font-weight: 800; color: #89b4fa; letter-spacing: -0.3px; background: transparent;")
-        title_col.addWidget(t)
-        sub = QLabel("Production-grade DICOM C-STORE migration with copy-only safety")
-        sub.setStyleSheet("font-size: 11px; color: #585b70; background: transparent;")
-        title_col.addWidget(sub)
-        header_layout.addLayout(title_col)
-        header_layout.addStretch()
+        # Sidebar navigation
+        self._sidebar = SidebarNav(self)
+        self._sidebar.add_page("config", "Configuration")
+        self._sidebar.add_page("browser", "File Browser")
+        self._sidebar.add_page("upload", "Upload")
+        self._sidebar.add_page("verify", "Verify")
+        self._sidebar.add_page("dashboard", "Dashboard")
+        self._sidebar.add_page("log", "Log")
+        content.addWidget(self._sidebar)
 
-        # Status badges
-        badge_row = QHBoxLayout(); badge_row.setSpacing(8)
-        safety = QLabel("  COPY-ONLY  ")
-        safety.setStyleSheet("background-color: rgba(166, 227, 161, 0.12); color: #a6e3a1; "
-            "padding: 5px 14px; border-radius: 6px; font-weight: 700; font-size: 11px; "
-            "border: 1px solid rgba(166, 227, 161, 0.25);")
-        safety.setToolTip(DATA_SAFETY_NOTICE)
-        badge_row.addWidget(safety)
+        # Page stack (replaces QTabWidget)
+        page_container = QVBoxLayout(); page_container.setContentsMargins(0, 0, 0, 0); page_container.setSpacing(0)
 
-        phi_badge = QLabel("  PHI PROTECTED  ")
-        phi_badge.setStyleSheet("background-color: rgba(137, 180, 250, 0.12); color: #89b4fa; "
-            "padding: 5px 14px; border-radius: 6px; font-weight: 700; font-size: 11px; "
-            "border: 1px solid rgba(137, 180, 250, 0.25);")
-        phi_badge.setToolTip(PHI_WARNING)
-        badge_row.addWidget(phi_badge)
+        # Page header with breadcrumb
+        self._page_header = QLabel("Configuration")
+        self._page_header.setStyleSheet(
+            "font-size: 18px; font-weight: 800; color: #cdd6f4; "
+            "padding: 14px 24px 8px 24px; background: transparent; "
+            "letter-spacing: -0.3px;")
+        page_container.addWidget(self._page_header)
+        # Subtle separator
+        _ph_sep = QFrame()
+        _ph_sep.setFixedHeight(1)
+        _ph_sep.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:1,y2:0, "
+            "stop:0 transparent, stop:0.1 #313244, stop:0.9 #313244, stop:1 transparent); "
+            "margin: 0 20px;")
+        page_container.addWidget(_ph_sep)
 
-        v = QLabel(f"v{VERSION}")
-        v.setStyleSheet("color: #45475a; font-size: 11px; font-weight: 700; background: transparent; padding: 5px 8px;")
-        badge_row.addWidget(v)
-        header_layout.addLayout(badge_row)
-        ml.addWidget(header_frame)
+        self._page_stack = QStackedWidget()
+        self._page_stack.setStyleSheet("QStackedWidget { background-color: #1e1e2e; }")
+        self._page_stack.addWidget(self._build_config_tab())
+        self._page_stack.addWidget(self._build_browser_tab())
+        self._page_stack.addWidget(self._build_upload_tab())
+        self._page_stack.addWidget(self._build_verify_tab())
+        self._page_stack.addWidget(self._build_dashboard_tab())
+        self._page_stack.addWidget(self._build_log_tab())
+        page_container.addWidget(self._page_stack, 1)
+        content.addLayout(page_container, 1)
 
-        self.tabs = QTabWidget(); ml.addWidget(self.tabs, 1)
-        self.tabs.addTab(self._build_config_tab(), "Configuration")
-        self.tabs.addTab(self._build_browser_tab(), "File Browser")
-        self.tabs.addTab(self._build_upload_tab(), "Upload")
-        self.tabs.addTab(self._build_verify_tab(), "Verify")
-        self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
-        self.tabs.addTab(self._build_log_tab(), "Log")
-        self.statusBar().showMessage("Ready - Copy-Only Mode Active - Source Data Protected - PHI Handling Active")
+        root.addLayout(content, 1)
+
+        # Connect sidebar to page stack
+        self._page_names = ["Configuration", "File Browser", "Upload", "Verify", "Dashboard", "Log"]
+        self._sidebar.page_changed.connect(self._on_page_changed)
+
+        # Status bar
+        self.statusBar().showMessage("Ready \u2014 Copy-Only Mode Active \u2014 Source Data Protected \u2014 PHI Handling Active")
+
+    def _on_page_changed(self, index):
+        """Handle sidebar page navigation."""
+        self._page_stack.setCurrentIndex(index)
+        if 0 <= index < len(self._page_names):
+            self._page_header.setText(self._page_names[index])
+
+    def _set_page(self, index):
+        """Navigate to a page by index (updates both sidebar and stack)."""
+        self._sidebar.set_current_index(index)
+        self._page_stack.setCurrentIndex(index)
+        if 0 <= index < len(self._page_names):
+            self._page_header.setText(self._page_names[index])
+
+    def _toggle_maximize(self):
+        if getattr(self, '_is_pseudo_maximized', False):
+            self._is_pseudo_maximized = False
+            if hasattr(self, '_normal_geometry'):
+                self.setGeometry(self._normal_geometry)
+            else:
+                self.showNormal()
+        else:
+            self._normal_geometry = self.geometry()
+            self._is_pseudo_maximized = True
+            if sys.platform == 'win32':
+                from PyQt5.QtWidgets import QDesktopWidget
+                screen = QDesktopWidget().availableGeometry(self)
+                self.setGeometry(screen)
+            else:
+                super().showMaximized()
+
+    def showMaximized(self):
+        """Override to respect taskbar with frameless windows on Windows."""
+        self._is_pseudo_maximized = True
+        if sys.platform == 'win32':
+            from PyQt5.QtWidgets import QDesktopWidget
+            screen = QDesktopWidget().availableGeometry(self)
+            self.setGeometry(screen)
+        else:
+            super().showMaximized()
+
+    # ── Frameless window resize support ──
+    def _get_resize_edge(self, pos):
+        m = self._resize_margin
+        r = self.rect()
+        edges = 0
+        if pos.x() <= m: edges |= 1         # left
+        if pos.x() >= r.width() - m: edges |= 2   # right
+        if pos.y() <= m: edges |= 4         # top
+        if pos.y() >= r.height() - m: edges |= 8  # bottom
+        return edges if edges else None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            edge = self._get_resize_edge(event.pos())
+            if edge:
+                self._resize_dragging = True
+                self._resize_edge = edge
+                self._resize_start_pos = event.globalPos()
+                self._resize_start_geo = self.geometry()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resize_dragging and self._resize_edge:
+            delta = event.globalPos() - self._resize_start_pos
+            geo = QRect(self._resize_start_geo)
+            if self._resize_edge & 1:  # left
+                geo.setLeft(geo.left() + delta.x())
+            if self._resize_edge & 2:  # right
+                geo.setRight(geo.right() + delta.x())
+            if self._resize_edge & 4:  # top
+                geo.setTop(geo.top() + delta.y())
+            if self._resize_edge & 8:  # bottom
+                geo.setBottom(geo.bottom() + delta.y())
+            if geo.width() >= self.minimumWidth() and geo.height() >= self.minimumHeight():
+                self.setGeometry(geo)
+            event.accept()
+            return
+        # Update cursor based on position
+        edge = self._get_resize_edge(event.pos())
+        if edge:
+            cursor_map = {
+                1: Qt.SizeHorCursor, 2: Qt.SizeHorCursor,
+                4: Qt.SizeVerCursor, 8: Qt.SizeVerCursor,
+                5: Qt.SizeFDiagCursor, 10: Qt.SizeFDiagCursor,
+                6: Qt.SizeBDiagCursor, 9: Qt.SizeBDiagCursor,
+            }
+            self.setCursor(cursor_map.get(edge, Qt.ArrowCursor))
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._resize_dragging = False
+        self._resize_edge = None
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    def _apply_glass_effects(self):
+        """Apply subtle drop shadows to all QGroupBox widgets for depth."""
+        for gb in self.findChildren(QGroupBox):
+            shadow = QGraphicsDropShadowEffect(gb)
+            shadow.setBlurRadius(16)
+            shadow.setColor(QColor(0, 0, 0, 30))
+            shadow.setOffset(0, 3)
+            gb.setGraphicsEffect(shadow)
 
     # ─── Config Tab ───────────────────────────────────────────────────────
     def _build_config_tab(self):
@@ -4839,6 +5981,35 @@ class MainWindow(QMainWindow):
         sl.addLayout(row)
         self.recursive_check = QCheckBox("Scan subfolders recursively"); self.recursive_check.setChecked(True)
         sl.addWidget(self.recursive_check)
+
+        # ═══ Pre-Scan Date Filter (v2.3.0) ═══
+        dfg = QGroupBox("Pre-Scan Date Filter (Dramatically Speeds Up Large Archives)")
+        dfl = QHBoxLayout(dfg); dfl.setSpacing(8)
+        self.prescan_date_enable = QCheckBox("Filter by StudyDate before full scan")
+        self.prescan_date_enable.setToolTip(
+            "Two-pass scan: Pass 1 reads ONLY the StudyDate tag from each file (ultra-fast),\n"
+            "then Pass 2 extracts full metadata only for files within your date range.\n"
+            "Eliminates 60-80% of heavy parsing on large legacy archives.")
+        self.prescan_date_enable.setChecked(False)
+        dfl.addWidget(self.prescan_date_enable)
+        dfl.addWidget(QLabel("From:"))
+        self.prescan_date_from = QDateEdit(); self.prescan_date_from.setCalendarPopup(True)
+        self.prescan_date_from.setDate(QDate.currentDate().addYears(-10))
+        self.prescan_date_from.setDisplayFormat("yyyy-MM-dd")
+        dfl.addWidget(self.prescan_date_from)
+        dfl.addWidget(QLabel("To:"))
+        self.prescan_date_to = QDateEdit(); self.prescan_date_to.setCalendarPopup(True)
+        self.prescan_date_to.setDate(QDate.currentDate())
+        self.prescan_date_to.setDisplayFormat("yyyy-MM-dd")
+        dfl.addWidget(self.prescan_date_to)
+        clear_cache_btn = QPushButton("Clear Scan Cache")
+        clear_cache_btn.setToolTip("Delete the SQLite scan cache for the current folder.\nForces a complete rescan on next run.")
+        clear_cache_btn.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        clear_cache_btn.clicked.connect(self._clear_scan_cache)
+        dfl.addWidget(clear_cache_btn)
+        dfl.addStretch()
+        sl.addWidget(dfg)
+
         btn_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan for DICOM Files"); self.scan_btn.setStyleSheet("font-size: 13px; padding: 8px 20px;")
         self.scan_btn.clicked.connect(self._start_scan); btn_row.addWidget(self.scan_btn)
@@ -5524,48 +6695,6 @@ class MainWindow(QMainWindow):
 
         return w
 
-    # ─── Live Settings Sync ─────────────────────────────────────────────
-    def _sync_live_settings(self):
-        """Push current widget values to the running upload/streaming thread.
-        Connected to widget signals so changes take effect immediately."""
-        thread = None
-        if hasattr(self, 'streaming_thread') and self.streaming_thread and self.streaming_thread.isRunning():
-            thread = self.streaming_thread
-        elif hasattr(self, 'upload_thread') and self.upload_thread and self.upload_thread.isRunning():
-            thread = self.upload_thread
-        if not thread:
-            return
-
-        thread.update_live_settings(
-            decompress_fallback=self.decompress_check.isChecked(),
-            conflict_retry=self.conflict_retry_check.isChecked(),
-            conflict_suffix=self.conflict_suffix_input.text().strip() or "_MIG",
-            batch_size=self.batch_spin.value(),
-            throttle_enabled=self.throttle_check.isChecked(),
-            throttle_rate=self.throttle_rate.value() if self.throttle_check.isChecked() else 0.0,
-            adaptive_enabled=self.adaptive_throttle_check.isChecked(),
-            tod_enabled=self.tod_check.isChecked(),
-            tod_peak_delay=self.tod_delay_spin.value(),
-            tod_peak_workers=self.tod_workers_spin.value(),
-            tod_peak_start=dtime(self.tod_start.time().hour(), self.tod_start.time().minute()),
-            tod_peak_end=dtime(self.tod_end.time().hour(), self.tod_end.time().minute()),
-        )
-
-    def _connect_live_settings(self):
-        """Wire config widgets so changes propagate to running threads instantly."""
-        self.decompress_check.stateChanged.connect(self._sync_live_settings)
-        self.conflict_retry_check.stateChanged.connect(self._sync_live_settings)
-        self.conflict_suffix_input.textChanged.connect(self._sync_live_settings)
-        self.batch_spin.valueChanged.connect(self._sync_live_settings)
-        self.throttle_check.stateChanged.connect(self._sync_live_settings)
-        self.throttle_rate.valueChanged.connect(self._sync_live_settings)
-        self.adaptive_throttle_check.stateChanged.connect(self._sync_live_settings)
-        self.tod_check.stateChanged.connect(self._sync_live_settings)
-        self.tod_delay_spin.valueChanged.connect(self._sync_live_settings)
-        self.tod_workers_spin.valueChanged.connect(self._sync_live_settings)
-        self.tod_start.timeChanged.connect(self._sync_live_settings)
-        self.tod_end.timeChanged.connect(self._sync_live_settings)
-
     # ─── Dashboard Update Timer ────────────────────────────────────────────
     def _start_dashboard_timer(self):
         if not self._dashboard_timer:
@@ -5705,6 +6834,21 @@ class MainWindow(QMainWindow):
         self._log(f"Auto-populated: {node['ip']}:{node['port']} AE=\"{node['ae_title']}\"")
         self.echo_status.setText(f"Discovered - {node['echo_status']}"); self.echo_status.setStyleSheet("color: #a6e3a1;")
 
+    def _clear_scan_cache(self):
+        """Clear the SQLite scan cache for the current folder."""
+        folder = self.folder_input.text().strip()
+        if not folder:
+            self._log("No folder selected — nothing to clear")
+            return
+        try:
+            cache = ScanCache(folder)
+            dc, sk = cache.get_scanned_count()
+            cache.clear()
+            cache.close()
+            self._log(f"Scan cache cleared: removed {dc:,} DICOM + {sk:,} skipped entries")
+        except Exception as e:
+            self._log(f"Failed to clear scan cache: {e}")
+
     def _start_scan(self):
         folder = self.folder_input.text().strip()
         if not folder or not os.path.isdir(folder): self._log("Invalid folder path"); return
@@ -5725,9 +6869,18 @@ class MainWindow(QMainWindow):
             else:
                 self.resume_label.setText("")
         else:
-            self.resume_label.setText("Manifest disabled — no files written to source folder")
+            self.resume_label.setText("Manifest disabled -- no files written to source folder")
 
-        self.scanner_thread = ScannerThread(folder, self.recursive_check.isChecked(), manifest=self.manifest)
+        # Pre-scan date filter (v2.3.0 two-pass optimization)
+        date_from = date_to = None
+        if self.prescan_date_enable.isChecked():
+            date_from = self.prescan_date_from.date().toString("yyyyMMdd")
+            date_to = self.prescan_date_to.date().toString("yyyyMMdd")
+            self._log(f"Pre-scan date filter active: {date_from} to {date_to}")
+
+        self.scanner_thread = ScannerThread(
+            folder, self.recursive_check.isChecked(), manifest=self.manifest,
+            date_from=date_from, date_to=date_to)
         self.scanner_thread.progress.connect(self._on_scan_progress)
         self.scanner_thread.current_file.connect(self._on_scan_file)
         self.scanner_thread.log.connect(self._log)
@@ -5779,7 +6932,7 @@ class MainWindow(QMainWindow):
         self.filter_modality.blockSignals(False)
 
         self._populate_tree(); self._update_stats()
-        if files: self.tabs.setCurrentIndex(1)
+        if files: self._set_page(1)
 
         # Auto data quality report
         if files:
@@ -6001,7 +7154,7 @@ class MainWindow(QMainWindow):
         files_to_send = files_override or self._get_selected_files()
         if not files_to_send: self._log("No files selected. Check selections in File Browser."); return
         host = self.host_input.text().strip()
-        if not host: self._log("Enter host"); self.tabs.setCurrentIndex(0); return
+        if not host: self._log("Enter host"); self._set_page(0); return
         self._save_settings()
 
         self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
@@ -6081,7 +7234,7 @@ class MainWindow(QMainWindow):
         self.upload_thread.conflict_retry_count.connect(self._on_conflict_count)
         self.upload_thread.auto_retry_healed.connect(self._on_healed_count)
         self.upload_thread.start()
-        self.tabs.setCurrentIndex(2)
+        self._set_page(2)
         self.stream_folder_lbl.setVisible(False)
 
     def _start_streaming(self):
@@ -6157,7 +7310,7 @@ class MainWindow(QMainWindow):
         self.streaming_thread.conflict_retry_count.connect(self._on_conflict_count)
         self.streaming_thread.auto_retry_healed.connect(self._on_healed_count)
         self.streaming_thread.start()
-        self.tabs.setCurrentIndex(2)
+        self._set_page(2)
 
     def _on_conflict_count(self, count):
         self._conflict_retries = count
@@ -6235,9 +7388,6 @@ class MainWindow(QMainWindow):
         if not failed_sops: self._log("No failed files to retry"); return
         retry_files = [f for f in self.dicom_files if f.get('sop_instance_uid', '') in failed_sops]
         if not retry_files: self._log("Could not match failed files"); return
-        # Clear failed status so they get re-attempted
-        for uid in failed_sops:
-            if uid in self.manifest.records: del self.manifest.records[uid]
         self._log(f"Retrying {len(retry_files)} failed files...")
         self._start_upload(files_override=retry_files)
 
@@ -6644,7 +7794,7 @@ class MainWindow(QMainWindow):
         self._dry_run_thread.log.connect(self._log)
         self.upload_progress.setMaximum(len(files_to_send))
         self.upload_progress.setValue(0)
-        self.tabs.setCurrentIndex(2)  # Upload tab
+        self._set_page(2)  # Upload tab
         self._dry_run_thread.start()
 
     def _on_dry_run_complete(self, ok, fail, skip):
@@ -7222,33 +8372,46 @@ tr:nth-child(even) {{ background: #181825; }}
     # Menu Bar
     # ═══════════════════════════════════════════════════════════════════════════
     def _build_menu_bar(self):
-        mb = self.menuBar()
-        mb.setStyleSheet("QMenuBar { background: #11111b; color: #cdd6f4; border-bottom: 1px solid #181825; }"
-            "QMenuBar::item:selected { background: rgba(137,180,250,0.15); }"
-            "QMenu { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; }"
-            "QMenu::item:selected { background: rgba(137,180,250,0.15); }")
+        # Hide native menu bar — use title bar popup menu instead
+        self.menuBar().setVisible(False)
 
-        # File menu
-        file_menu = mb.addMenu("File")
-        profiles_menu = file_menu.addMenu("Connection Profiles")
+        menu_style = ("QMenu { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; "
+            "border-radius: 6px; padding: 4px; }"
+            "QMenu::item { padding: 6px 24px 6px 12px; border-radius: 4px; }"
+            "QMenu::item:selected { background: rgba(137,180,250,0.15); }"
+            "QMenu::separator { height: 1px; background: #313244; margin: 4px 8px; }")
+
+        app_menu = QMenu(self)
+        app_menu.setStyleSheet(menu_style)
+
+        # Profiles submenu
+        profiles_menu = app_menu.addMenu("Connection Profiles")
+        profiles_menu.setStyleSheet(menu_style)
         save_profile = profiles_menu.addAction("Save Current as Profile...")
         save_profile.triggered.connect(self._save_profile)
         self._profiles_load_menu = profiles_menu.addMenu("Load Profile")
+        self._profiles_load_menu.setStyleSheet(menu_style)
         profiles_menu.addSeparator()
         manage_profiles = profiles_menu.addAction("Delete Profile...")
         manage_profiles.triggered.connect(self._delete_profile)
         self._refresh_profiles_menu()
 
-        file_menu.addSeparator()
-        history_action = file_menu.addAction("Migration History...")
+        app_menu.addSeparator()
+        history_action = app_menu.addAction("Migration History...")
         history_action.triggered.connect(self._show_history)
 
-        # Help menu
-        help_menu = mb.addMenu("Help")
-        about_action = help_menu.addAction("About")
+        app_menu.addSeparator()
+        about_action = app_menu.addAction("About")
         about_action.triggered.connect(self._show_about)
-        github_action = help_menu.addAction("GitHub Repository")
+        github_action = app_menu.addAction("GitHub Repository")
         github_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/SysAdminDoc/dicom-pacs-migrator")))
+
+        # Connect title bar menu button
+        self._title_bar._menu_btn.clicked.connect(
+            lambda: app_menu.exec_(self._title_bar._menu_btn.mapToGlobal(
+                QPoint(0, self._title_bar._menu_btn.height())))
+        )
+        self._app_menu = app_menu  # prevent GC
 
     # ═══════════════════════════════════════════════════════════════════════════
     # System Tray
@@ -7328,7 +8491,7 @@ tr:nth-child(even) {{ background: #181825; }}
             path = url.toLocalFile()
             if os.path.isdir(path):
                 self.folder_input.setText(path)
-                self.tabs.setCurrentIndex(0)
+                self._set_page(0)
                 self._log(f"Folder dropped: {path}")
                 break
 
@@ -7627,6 +8790,47 @@ tr:nth-child(even) {{ background: #181825; }}
         layout.addWidget(close_btn)
         d.exec_()
 
+    def _sync_live_settings(self):
+        """Push current widget values to the running upload/streaming thread.
+        Connected to widget signals so changes take effect immediately."""
+        thread = None
+        if hasattr(self, 'streaming_thread') and self.streaming_thread and self.streaming_thread.isRunning():
+            thread = self.streaming_thread
+        elif hasattr(self, 'upload_thread') and self.upload_thread and self.upload_thread.isRunning():
+            thread = self.upload_thread
+        if not thread:
+            return
+
+        thread.update_live_settings(
+            decompress_fallback=self.decompress_check.isChecked(),
+            conflict_retry=self.conflict_retry_check.isChecked(),
+            conflict_suffix=self.conflict_suffix_input.text().strip() or "_MIG",
+            batch_size=self.batch_spin.value(),
+            throttle_enabled=self.throttle_check.isChecked(),
+            throttle_rate=self.throttle_rate.value() if self.throttle_check.isChecked() else 0.0,
+            adaptive_enabled=self.adaptive_throttle_check.isChecked(),
+            tod_enabled=self.tod_check.isChecked(),
+            tod_peak_delay=self.tod_delay_spin.value(),
+            tod_peak_workers=self.tod_workers_spin.value(),
+            tod_peak_start=dtime(self.tod_start.time().hour(), self.tod_start.time().minute()),
+            tod_peak_end=dtime(self.tod_end.time().hour(), self.tod_end.time().minute()),
+        )
+
+    def _connect_live_settings(self):
+        """Wire config widgets so changes propagate to running threads instantly."""
+        self.decompress_check.stateChanged.connect(self._sync_live_settings)
+        self.conflict_retry_check.stateChanged.connect(self._sync_live_settings)
+        self.conflict_suffix_input.textChanged.connect(self._sync_live_settings)
+        self.batch_spin.valueChanged.connect(self._sync_live_settings)
+        self.throttle_check.stateChanged.connect(self._sync_live_settings)
+        self.throttle_rate.valueChanged.connect(self._sync_live_settings)
+        self.adaptive_throttle_check.stateChanged.connect(self._sync_live_settings)
+        self.tod_check.stateChanged.connect(self._sync_live_settings)
+        self.tod_delay_spin.valueChanged.connect(self._sync_live_settings)
+        self.tod_workers_spin.valueChanged.connect(self._sync_live_settings)
+        self.tod_start.timeChanged.connect(self._sync_live_settings)
+        self.tod_end.timeChanged.connect(self._sync_live_settings)
+
     def _save_settings(self):
         s = self.settings
         s.setValue("folder", self.folder_input.text()); s.setValue("host", self.host_input.text())
@@ -7742,7 +8946,7 @@ def main():
     if sys.platform == 'win32':
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SysAdminDoc.DICOMPACSMigrator.2.2.0')
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SysAdminDoc.DICOMPACSMigrator.3.0.0')
         except Exception:
             pass
     app.setStyle("Fusion"); app.setStyleSheet(DARK_STYLE)
