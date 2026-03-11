@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v3.0.0
+DICOM PACS Migrator v3.1.0
 Production-grade DICOM C-STORE migration tool with premium sidebar navigation,
 frameless window, glassmorphic UI, parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
@@ -3225,9 +3225,35 @@ class UploadThread(QThread):
                 f, ok, msg, sop, was_conflict, fsize = result_q.get(timeout=0.5)
             except queue.Empty:
                 if not feed_thread.is_alive():
-                    # Drain remaining results
+                    # Drain remaining results — must still process each one
                     try:
-                        while True: result_q.get_nowait(); processed += 1
+                        while True:
+                            f, ok, msg, sop, was_conflict, fsize = result_q.get_nowait()
+                            processed += 1
+                            fpath = f['path']
+                            if was_conflict:
+                                self._conflict_retries += 1
+                                self.conflict_retry_count.emit(self._conflict_retries)
+                            if ok:
+                                if "Already sent" in msg:
+                                    skipped += 1
+                                else:
+                                    sent += 1; bytes_sent += fsize
+                                self.file_sent.emit(fpath, True, msg, sop)
+                                if self.manifest and "Already sent" not in msg:
+                                    self.manifest.record_file(sop, fpath, 'sent', msg,
+                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                            else:
+                                if "Invalid DICOM" in msg:
+                                    skipped += 1
+                                    if self.manifest: self.manifest.record_file(sop, fpath, 'skipped', msg)
+                                else:
+                                    failed += 1
+                                    self.failure_reasons[msg[:80]] += 1
+                                    if is_retryable_error(msg): retry_pending[sop] = f
+                                    if self.manifest: self.manifest.record_file(sop, fpath, 'failed', msg,
+                                        **{k: f.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                                self.file_sent.emit(fpath, False, msg, sop)
                     except queue.Empty:
                         pass
                     if processed >= total: break
@@ -7198,7 +7224,7 @@ class MainWindow(QMainWindow):
                          else os.path.expanduser('~'), f"migration_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
             self._audit_logger = AuditLogger(audit_path)
             self._audit_logger.log_event('migration_start',
-                source=self.source_input.text(), destination=f"{host}:{self.port_input.value()}",
+                source=self.folder_input.text(), destination=f"{host}:{self.port_input.value()}",
                 file_count=len(files_to_send), ae_scu=self.ae_scu.text().strip(),
                 ae_scp=self.ae_scp.text().strip())
             self._log(f"Audit log: {audit_path}")
@@ -8946,7 +8972,7 @@ def main():
     if sys.platform == 'win32':
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SysAdminDoc.DICOMPACSMigrator.3.0.0')
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SysAdminDoc.DICOMPACSMigrator.3.1.0')
         except Exception:
             pass
     app.setStyle("Fusion"); app.setStyleSheet(DARK_STYLE)
