@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v3.3.0
+DICOM PACS Migrator v3.4.0
 Production-grade DICOM C-STORE migration tool with premium sidebar navigation,
 frameless window, glassmorphic UI, parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
@@ -10,10 +10,12 @@ migration, decompress fallback, patient ID conflict resolution, pre-flight
 duplicate skip, DICOM validation, error classification, circuit breaker destination
 protection, adaptive latency-based throttling, transfer syntax probing, pre-migration
 data quality analysis, HIPAA audit logging, auto-verify two-point confirmation,
-study-level batching, time-of-day peak-hours rate control, SOP class fallback
-to Secondary Capture, priority queue for urgent studies, batched Storage Commitment,
-two-pass date-range pre-filter scanning, threaded parallel scan with SQLite cache,
-DICOM magic byte pre-check, and extension-based non-DICOM skip.
+study-level batching, time-of-day peak-hours rate control with worker scaling,
+SOP class fallback to Secondary Capture, priority queue for urgent studies,
+batched Storage Commitment, two-pass date-range pre-filter scanning, threaded
+parallel scan with SQLite cache, DICOM magic byte pre-check, extension-based
+non-DICOM skip, study date priority sorting, SOP class frequency-prioritized
+batching, and DICOMweb STOW-RS HTTP transport.
 Copy-only architecture — source data is NEVER modified or deleted.
 """
 # SPDX-License-Identifier: MIT
@@ -85,7 +87,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -2775,6 +2777,105 @@ class ScannerThread(QThread):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DICOMweb STOW-RS Sender — HTTP-based DICOM upload for cloud PACS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def stowrs_send_file(fpath, stowrs_url, auth_header=None, log_fn=None):
+    """Send a single DICOM file via DICOMweb STOW-RS (multipart/related POST).
+    Returns (success: bool, message: str, bytes_sent: int)."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        with open(fpath, 'rb') as f:
+            dicom_data = f.read()
+    except (OSError, PermissionError) as e:
+        return (False, f"Read error: {e}", 0)
+
+    boundary = f"----DICOMwebBoundary{secrets.token_hex(8)}"
+    content_type = f"multipart/related; type=\"application/dicom\"; boundary={boundary}"
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/dicom\r\n\r\n"
+    ).encode('utf-8') + dicom_data + f"\r\n--{boundary}--\r\n".encode('utf-8')
+
+    req = urllib.request.Request(stowrs_url, data=body, method='POST')
+    req.add_header('Content-Type', content_type)
+    req.add_header('Accept', 'application/dicom+json')
+    if auth_header:
+        req.add_header('Authorization', auth_header)
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=120)
+        status_code = resp.getcode()
+        if status_code in (200, 201):
+            return (True, f"STOW-RS OK ({status_code})", len(dicom_data))
+        else:
+            return (False, f"STOW-RS HTTP {status_code}", len(dicom_data))
+    except urllib.error.HTTPError as e:
+        body_text = ""
+        try:
+            body_text = e.read().decode('utf-8', errors='replace')[:200]
+        except Exception:
+            pass
+        return (False, f"STOW-RS HTTP {e.code}: {body_text}", 0)
+    except urllib.error.URLError as e:
+        return (False, f"STOW-RS connection error: {e.reason}", 0)
+    except Exception as e:
+        return (False, f"STOW-RS error: {e}", 0)
+
+
+def _stowrs_worker(worker_id, stowrs_url, auth_header,
+                    file_queue, result_queue, cancel_event, pause_event,
+                    throttle=None, adaptive_throttle=None,
+                    tod_rate_control=None, total_workers=1):
+    """Worker thread for STOW-RS uploads. Processes files from queue via HTTP."""
+    while not cancel_event.is_set():
+        pause_event.wait()
+
+        # TOD worker scaling
+        if tod_rate_control and tod_rate_control.enabled:
+            effective = tod_rate_control.get_effective_workers(total_workers)
+            if worker_id >= effective:
+                time.sleep(5.0)
+                continue
+
+        if adaptive_throttle:
+            delay = adaptive_throttle.get_delay()
+            if delay > 0:
+                time.sleep(delay)
+
+        if tod_rate_control:
+            tod_rate_control.check_and_log_transition()
+            tod_delay = tod_rate_control.get_delay()
+            if tod_delay > 0:
+                time.sleep(tod_delay)
+
+        try:
+            item = file_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if item is _SENTINEL:
+            break
+
+        f = item
+        fpath = f['path']; sop = f.get('sop_instance_uid', '')
+
+        t0 = time.time()
+        success, msg, bsent = stowrs_send_file(fpath, stowrs_url, auth_header)
+        elapsed = time.time() - t0
+
+        if adaptive_throttle:
+            adaptive_throttle.record(elapsed)
+
+        if throttle:
+            throttle.throttle(bsent)
+
+        result_queue.put((f, success, msg, sop, False, bsent))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Parallel Send Engine — Multiple worker threads with persistent associations
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2786,7 +2887,8 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                   pid_cache, pid_cache_lock, retry_count,
                   throttle=None, tag_rules=None, tls_context=None,
                   circuit_breaker=None, adaptive_throttle=None,
-                  tod_rate_control=None, priority_queue=None):
+                  tod_rate_control=None, priority_queue=None,
+                  total_workers=1):
     """Worker thread: maintains its own DICOM association and processes files from queue.
     Reads decompress_fallback, conflict_retry, conflict_suffix from live_config dict
     each iteration so changes take effect immediately without restart."""
@@ -2815,6 +2917,13 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
 
     while not cancel_event.is_set():
         pause_event.wait()  # Block if paused
+
+        # TOD worker scaling: excess workers sleep during peak hours
+        if tod_rate_control and tod_rate_control.enabled:
+            effective = tod_rate_control.get_effective_workers(total_workers)
+            if worker_id >= effective:
+                time.sleep(5.0)  # Sleep and re-check — this worker is idle during peak
+                continue
 
         # Adaptive backoff: if the PACS has been returning 0xA700, slow down
         # before pulling the next file. Resets on any non-0xA700 result.
@@ -3011,7 +3120,8 @@ class UploadThread(QThread):
                  skip_existing=False, workers=1, max_retries=3,
                  throttle=None, tag_rules=None, tls_context=None,
                  adaptive_throttle_enabled=False, study_batching=False,
-                 tod_rate_control=None):
+                 tod_rate_control=None, sort_order="Directory Order",
+                 transport="DICOM C-STORE", stowrs_url=None, stowrs_auth=None):
         super().__init__()
         self.files = files; self.host = host; self.port = port
         self.ae_scu = ae_scu; self.ae_scp = ae_scp
@@ -3028,6 +3138,10 @@ class UploadThread(QThread):
         self.tls_context = tls_context
         self.study_batching = study_batching
         self._tod_rate_control = tod_rate_control
+        self.sort_order = sort_order
+        self.transport = transport
+        self.stowrs_url = stowrs_url
+        self.stowrs_auth = stowrs_auth
         self.failure_reasons = defaultdict(int)
         self._conflict_retries = 0
         self._healed_count = 0
@@ -3114,7 +3228,18 @@ class UploadThread(QThread):
         ae = AE(ae_title=self.ae_scu); ae.maximum_pdu_size = self.max_pdu
         ae.acse_timeout = 30; ae.dimse_timeout = 120; ae.network_timeout = 30
         added = set()
-        for uid in sop_classes:
+        # Prioritize by frequency: most common SOP classes get primary association
+        if len(set(sop_classes)) > 126:
+            freq = {}
+            for uid in sop_classes:
+                freq[uid] = freq.get(uid, 0) + 1
+            sorted_uids = sorted(set(sop_classes), key=lambda u: freq.get(u, 0), reverse=True)
+            overflow = len(set(sop_classes)) - 126
+            self.log.emit(f"SOP batching: {len(set(sop_classes))} unique SOP classes, {overflow} overflow "
+                          f"(will use targeted fallback associations)")
+        else:
+            sorted_uids = list(dict.fromkeys(sop_classes))  # dedupe preserving order
+        for uid in sorted_uids:
             if uid not in added and len(added) < 126:
                 ae.add_requested_context(uid, TRANSFER_SYNTAXES); added.add(uid)
         ae.add_requested_context(Verification); return ae
@@ -3198,6 +3323,14 @@ class UploadThread(QThread):
                     if retryable_failed:
                         self.log.emit(f"  ({retryable_failed:,} previously failed files will be retried)")
 
+        # ── Study date sorting ──
+        if self.sort_order == "Newest First":
+            self.files.sort(key=lambda f: f.get('study_date', '') or '', reverse=True)
+            self.log.emit(f"Sort: newest studies first ({len(self.files):,} files)")
+        elif self.sort_order == "Oldest First":
+            self.files.sort(key=lambda f: f.get('study_date', '') or '')
+            self.log.emit(f"Sort: oldest studies first ({len(self.files):,} files)")
+
         if total == 0:
             self.log.emit("All files already sent. Nothing to do.")
             self.finished.emit(0, 0, skipped)
@@ -3242,16 +3375,25 @@ class UploadThread(QThread):
         # Start persistent workers
         worker_threads = []
         for wid in range(self.workers):
-            t = threading.Thread(
-                target=_send_worker, daemon=True,
-                args=(wid, ae_builder, self.host, self.port,
-                      self.ae_scp, self.ae_scu,
-                      file_q, result_q, self._cancel_event, self._pause_event,
-                      self._live_config,
-                      self._pid_cache, self._pid_cache_lock, self.retry_count,
-                      self.throttle, self.tag_rules, self.tls_context,
-                      self._circuit_breaker, self._adaptive_throttle,
-                      self._tod_rate_control, self._priority_queue))
+            if self.transport == "DICOMweb STOW-RS":
+                t = threading.Thread(
+                    target=_stowrs_worker, daemon=True,
+                    args=(wid, self.stowrs_url, self.stowrs_auth,
+                          file_q, result_q, self._cancel_event, self._pause_event,
+                          self.throttle, self._adaptive_throttle,
+                          self._tod_rate_control, self.workers))
+            else:
+                t = threading.Thread(
+                    target=_send_worker, daemon=True,
+                    args=(wid, ae_builder, self.host, self.port,
+                          self.ae_scp, self.ae_scu,
+                          file_q, result_q, self._cancel_event, self._pause_event,
+                          self._live_config,
+                          self._pid_cache, self._pid_cache_lock, self.retry_count,
+                          self.throttle, self.tag_rules, self.tls_context,
+                          self._circuit_breaker, self._adaptive_throttle,
+                          self._tod_rate_control, self._priority_queue,
+                          self.workers))
             t.start()
             worker_threads.append(t)
 
@@ -3735,7 +3877,9 @@ class StreamingMigrationThread(QThread):
                  throttle=None, tag_rules=None, tls_context=None,
                  schedule_enabled=False, schedule_start=None, schedule_end=None,
                  filter_modalities=None, filter_date_from=None, filter_date_to=None,
-                 adaptive_throttle_enabled=False, tod_rate_control=None):
+                 adaptive_throttle_enabled=False, tod_rate_control=None,
+                 sort_order="Directory Order",
+                 transport="DICOM C-STORE", stowrs_url=None, stowrs_auth=None):
         super().__init__()
         self.root_folder = root_folder
         self.host = host; self.port = port
@@ -3758,6 +3902,10 @@ class StreamingMigrationThread(QThread):
         self.filter_date_from = filter_date_from
         self.filter_date_to = filter_date_to
         self._tod_rate_control = tod_rate_control
+        self.sort_order = sort_order
+        self.transport = transport
+        self.stowrs_url = stowrs_url
+        self.stowrs_auth = stowrs_auth
         self.failure_reasons = defaultdict(int)
         self._conflict_retries = 0
         self._healed_count = 0
@@ -3830,7 +3978,17 @@ class StreamingMigrationThread(QThread):
         ae = AE(ae_title=self.ae_scu); ae.maximum_pdu_size = self.max_pdu
         ae.acse_timeout = 30; ae.dimse_timeout = 120; ae.network_timeout = 30
         added = set()
-        for uid in sop_classes:
+        if len(set(sop_classes)) > 126:
+            freq = {}
+            for uid in sop_classes:
+                freq[uid] = freq.get(uid, 0) + 1
+            sorted_uids = sorted(set(sop_classes), key=lambda u: freq.get(u, 0), reverse=True)
+            overflow = len(set(sop_classes)) - 126
+            self.log.emit(f"SOP batching: {len(set(sop_classes))} unique SOP classes, {overflow} overflow "
+                          f"(will use targeted fallback associations)")
+        else:
+            sorted_uids = list(dict.fromkeys(sop_classes))
+        for uid in sorted_uids:
             if uid not in added and len(added) < 126:
                 ae.add_requested_context(uid, TRANSFER_SYNTAXES); added.add(uid)
         ae.add_requested_context(Verification); return ae
@@ -4252,16 +4410,25 @@ class StreamingMigrationThread(QThread):
             file_q = queue.Queue(maxsize=self.workers * 4)
             result_q = queue.Queue()
             for wid in range(self.workers):
-                t = threading.Thread(
-                    target=_send_worker, daemon=True,
-                    args=(wid, ae_builder, self.host, self.port,
-                          self.ae_scp, self.ae_scu,
-                          file_q, result_q, self._cancel_event, self._pause_event,
-                          self._live_config,
-                          self._pid_cache, self._pid_cache_lock, self.retry_count,
-                          self.throttle, self.tag_rules, self.tls_context,
-                          self._circuit_breaker, self._adaptive_throttle,
-                          self._tod_rate_control))
+                if self.transport == "DICOMweb STOW-RS":
+                    t = threading.Thread(
+                        target=_stowrs_worker, daemon=True,
+                        args=(wid, self.stowrs_url, self.stowrs_auth,
+                              file_q, result_q, self._cancel_event, self._pause_event,
+                              self.throttle, self._adaptive_throttle,
+                              self._tod_rate_control, self.workers))
+                else:
+                    t = threading.Thread(
+                        target=_send_worker, daemon=True,
+                        args=(wid, ae_builder, self.host, self.port,
+                              self.ae_scp, self.ae_scu,
+                              file_q, result_q, self._cancel_event, self._pause_event,
+                              self._live_config,
+                              self._pid_cache, self._pid_cache_lock, self.retry_count,
+                              self.throttle, self.tag_rules, self.tls_context,
+                              self._circuit_breaker, self._adaptive_throttle,
+                              self._tod_rate_control, None,
+                              self.workers))
                 t.start()
                 worker_threads.append(t)
 
@@ -4405,6 +4572,12 @@ class StreamingMigrationThread(QThread):
 
                 if not dir_files:
                     continue
+
+            # ── Study date sorting ──
+            if self.sort_order == "Newest First":
+                dir_files.sort(key=lambda f: f.get('study_date', '') or '', reverse=True)
+            elif self.sort_order == "Oldest First":
+                dir_files.sort(key=lambda f: f.get('study_date', '') or '')
 
             if dirs_done <= 3 or dirs_done % 25 == 0:
                 self.log.emit(f"  [{dirs_done}] {rel_dir}: {len(dir_files)} DICOM files")
@@ -6151,6 +6324,27 @@ class MainWindow(QMainWindow):
         r3.addWidget(QLabel("Hostname:")); self.hostname_lbl = QLabel("-"); self.hostname_lbl.setStyleSheet("color: #6c7086;"); r3.addWidget(self.hostname_lbl, 1)
         r3.addWidget(QLabel("Impl:")); self.impl_lbl = QLabel("-"); self.impl_lbl.setStyleSheet("color: #6c7086;"); r3.addWidget(self.impl_lbl, 1)
         dl.addLayout(r3)
+        tr = QHBoxLayout()
+        tr.addWidget(QLabel("Transport:"))
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItems(["DICOM C-STORE", "DICOMweb STOW-RS"])
+        self.transport_combo.setToolTip("C-STORE: Traditional DICOM association (default)\n"
+            "STOW-RS: HTTP-based DICOMweb upload for cloud PACS")
+        self.transport_combo.currentTextChanged.connect(self._on_transport_changed)
+        tr.addWidget(self.transport_combo)
+        tr.addWidget(QLabel("URL:"))
+        self.stowrs_url = QLineEdit()
+        self.stowrs_url.setPlaceholderText("https://pacs.example.com/dicom-web/studies")
+        self.stowrs_url.setToolTip("DICOMweb STOW-RS endpoint URL")
+        self.stowrs_url.setVisible(False)
+        tr.addWidget(self.stowrs_url, 1)
+        self.stowrs_auth = QLineEdit()
+        self.stowrs_auth.setPlaceholderText("Bearer token (optional)")
+        self.stowrs_auth.setToolTip("Authorization header value for STOW-RS (e.g. 'Bearer xxx' or 'Basic xxx')")
+        self.stowrs_auth.setVisible(False)
+        tr.addWidget(self.stowrs_auth, 1)
+        tr.addStretch()
+        dl.addLayout(tr)
         er = QHBoxLayout()
         self.echo_btn = QPushButton("C-ECHO Verify"); self.echo_btn.setProperty("warning", True); self.echo_btn.clicked.connect(self._run_echo)
         er.addWidget(self.echo_btn); self.echo_status = QLabel(""); er.addWidget(self.echo_status, 1)
@@ -6263,6 +6457,12 @@ class MainWindow(QMainWindow):
             "Keeps all images from the same study together for atomic transfers, "
             "simplified verification, and optimal presentation context negotiation.")
         study_batch_row.addWidget(self.study_batch_check)
+        study_batch_row.addWidget(QLabel("Sort:"))
+        self.sort_order_combo = QComboBox()
+        self.sort_order_combo.addItems(["Directory Order", "Newest First", "Oldest First"])
+        self.sort_order_combo.setToolTip("Sort studies by StudyDate before sending. "
+            "'Newest First' prioritizes recent studies, 'Oldest First' starts with historical data.")
+        study_batch_row.addWidget(self.sort_order_combo)
         study_batch_row.addStretch()
         al.addLayout(study_batch_row)
 
@@ -6885,6 +7085,19 @@ class MainWindow(QMainWindow):
             peak_delay=self.tod_delay_spin.value(),
             enabled=True, log_fn=self._log)
 
+    def _on_transport_changed(self, text):
+        """Toggle UI elements based on transport mode."""
+        is_stowrs = text == "DICOMweb STOW-RS"
+        self.stowrs_url.setVisible(is_stowrs)
+        self.stowrs_auth.setVisible(is_stowrs)
+        # C-STORE fields
+        self.host_input.setVisible(not is_stowrs)
+        self.port_input.setVisible(not is_stowrs)
+        self.ae_scu.setVisible(not is_stowrs)
+        self.ae_scp.setVisible(not is_stowrs)
+        self.echo_btn.setVisible(not is_stowrs)
+        self.echo_status.setVisible(not is_stowrs)
+
     def _get_schedule_start(self):
         """Get schedule start time as datetime.time."""
         qt = self.schedule_start.time()
@@ -7254,7 +7467,12 @@ class MainWindow(QMainWindow):
         files_to_send = files_override or self._get_selected_files()
         if not files_to_send: self._log("No files selected. Check selections in File Browser."); return
         host = self.host_input.text().strip()
-        if not host: self._log("Enter host"); self._set_page(0); return
+        if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+            if not self.stowrs_url.text().strip():
+                self._log("Enter STOW-RS endpoint URL"); self._set_page(0); return
+            host = host or "stowrs"  # Placeholder for STOW-RS mode
+        elif not host:
+            self._log("Enter host"); self._set_page(0); return
         self._save_settings()
 
         self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
@@ -7272,9 +7490,9 @@ class MainWindow(QMainWindow):
         self.export_csv_btn.setEnabled(False)
         self.upload_start_time = time.time()
 
-        # Transfer syntax probe — discover what destination accepts before sending
+        # Transfer syntax probe — discover what destination accepts before sending (C-STORE only)
         sop_classes = list(set(f['sop_class_uid'] for f in files_to_send))
-        if self.ts_probe_check.isChecked() and len(sop_classes) > 0:
+        if self.ts_probe_check.isChecked() and len(sop_classes) > 0 and self.transport_combo.currentText() != "DICOMweb STOW-RS":
             self._log(f"Probing destination for {len(sop_classes)} SOP classes...")
             try:
                 accepted, rejected = probe_destination_ts(
@@ -7323,7 +7541,11 @@ class MainWindow(QMainWindow):
             tls_context=self._build_tls_context(),
             adaptive_throttle_enabled=self.adaptive_throttle_check.isChecked(),
             study_batching=self.study_batch_check.isChecked(),
-            tod_rate_control=self._build_tod_rate_control())
+            tod_rate_control=self._build_tod_rate_control(),
+            sort_order=self.sort_order_combo.currentText(),
+            transport=self.transport_combo.currentText(),
+            stowrs_url=self.stowrs_url.text().strip() or None,
+            stowrs_auth=self.stowrs_auth.text().strip() or None)
         self.upload_thread.progress.connect(self._on_upload_progress)
         self.upload_thread.file_sent.connect(self._on_file_sent)
         self.upload_thread.finished.connect(self._on_upload_complete)
@@ -7343,7 +7565,11 @@ class MainWindow(QMainWindow):
         if not folder or not os.path.isdir(folder):
             self._log("Enter a valid DICOM folder path"); return
         host = self.host_input.text().strip()
-        if not host:
+        if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+            if not self.stowrs_url.text().strip():
+                self._log("Enter STOW-RS endpoint URL"); return
+            host = host or "stowrs"
+        elif not host:
             self._log("Enter a destination host/IP"); return
         self._save_settings()
 
@@ -7399,7 +7625,11 @@ class MainWindow(QMainWindow):
             filter_date_from=self._get_stream_date_from(),
             filter_date_to=self._get_stream_date_to(),
             adaptive_throttle_enabled=self.adaptive_throttle_check.isChecked(),
-            tod_rate_control=self._build_tod_rate_control())
+            tod_rate_control=self._build_tod_rate_control(),
+            sort_order=self.sort_order_combo.currentText(),
+            transport=self.transport_combo.currentText(),
+            stowrs_url=self.stowrs_url.text().strip() or None,
+            stowrs_auth=self.stowrs_auth.text().strip() or None)
         self.streaming_thread.file_sent.connect(self._on_file_sent)
         self.streaming_thread.finished.connect(self._on_streaming_complete)
         self.streaming_thread.error.connect(lambda e: self._log(f"ERROR: {e}"))
