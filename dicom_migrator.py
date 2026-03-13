@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v3.1.0
+DICOM PACS Migrator v3.2.0
 Production-grade DICOM C-STORE migration tool with premium sidebar navigation,
 frameless window, glassmorphic UI, parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
@@ -85,7 +85,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -593,13 +593,22 @@ class CircuitBreaker:
             time.sleep(1.0)
 
     def record_success(self):
-        """Record a successful request. Resets circuit to CLOSED."""
+        """Record a successful request. Transitions HALF_OPEN -> CLOSED or
+        decays failure counter in CLOSED state. Ignores stale successes
+        from in-flight requests when breaker is OPEN."""
         with self._lock:
             if self._state == self.HALF_OPEN:
                 if self._log_fn:
                     self._log_fn(f"  Circuit breaker: probe succeeded — CLOSED (resuming normal operation)")
-            self._consecutive_failures = 0
-            self._state = self.CLOSED
+                self._consecutive_failures = 0
+                self._state = self.CLOSED
+            elif self._state == self.CLOSED:
+                # Decay instead of reset: prevents one healthy worker from masking
+                # failures across multiple workers sharing this breaker
+                self._consecutive_failures = self._consecutive_failures // 2
+            # OPEN: ignore — stale success from a request that was already
+            # in-flight before the breaker tripped. The recovery period
+            # and HALF_OPEN probe must complete before resuming.
 
     def record_failure(self):
         """Record a failed request. May trip the breaker to OPEN."""
@@ -1367,6 +1376,8 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
     def _do_send(association, dataset):
         """Returns (status, message, was_decompressed, new_assoc_or_None)."""
         try:
+            if not association.is_established:
+                return (-1, "The association with a peer SCP must be established before sending a C-STORE request", False, None)
             st = association.send_c_store(dataset)
             if st:
                 detail = _status_detail(st)
@@ -1446,6 +1457,35 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
 
     # First attempt — send as-is
     status_val, msg, was_decompressed, new_assoc = _do_send(assoc, ds)
+
+    # ── Association-dead recovery — re-associate and retry once ──
+    # pynetdicom raises when the association was aborted/dropped by the SCP
+    # between _get_assoc check and the actual send_c_store call.
+    if status_val == -1 and msg and any(p in msg.lower() for p in
+            ('association', 'established', 'transport', 'connection', 'socket')):
+        if host and port and ae_scp and ae:
+            try:
+                if tls_context:
+                    retry_assoc = ae.associate(host, port, ae_title=ae_scp, tls_args=(tls_context,))
+                else:
+                    retry_assoc = ae.associate(host, port, ae_title=ae_scp)
+                if retry_assoc.is_established:
+                    rv, rm, rd, _ = _do_send(retry_assoc, ds)
+                    if _is_cstore_success(rv):
+                        # Success — return immediately with the reconnected assoc
+                        return (rv, rm, rd, False, retry_assoc)
+                    # Non-success DICOM status (0xA700, 0xFFFB, 0xC000, etc.) —
+                    # update status so downstream handlers can attempt recovery
+                    # using their own targeted associations. Release retry_assoc
+                    # to avoid leaking it through the multi-handler return paths.
+                    status_val, msg, was_decompressed = rv, rm, rd
+                    try: retry_assoc.release()
+                    except: pass
+                else:
+                    try: retry_assoc.release()
+                    except: pass
+            except Exception:
+                pass  # Re-association failed — original error stands
 
     # ── 0xA700: "Out of Resources" — immediate retry with backoff ──
     # This is usually transient: PACS ingest queue is saturated, not disk full.
@@ -2759,6 +2799,7 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
 
     ae = ae_builder()
     _a700_consecutive = 0  # Track consecutive 0xA700s for adaptive backoff
+    _assoc_dead_consecutive = 0  # Track consecutive association-dead failures
 
     while not cancel_event.is_set():
         pause_event.wait()  # Block if paused
@@ -2767,6 +2808,11 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
         # before pulling the next file. Resets on any non-0xA700 result.
         if _a700_consecutive > 0:
             backoff = min(1.0 * _a700_consecutive, 10.0)  # 1s, 2s, 3s... up to 10s
+            time.sleep(backoff)
+
+        # Association-dead backoff: exponential delay when association keeps dying
+        if _assoc_dead_consecutive > 0:
+            backoff = min(2.0 * (2 ** (_assoc_dead_consecutive - 1)), 30.0)  # 2s, 4s, 8s, 16s, 30s max
             time.sleep(backoff)
 
         # Adaptive latency-based throttle — adds delay when destination is slow
@@ -2881,9 +2927,14 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 except: pass
                 assoc = None
 
+            # Detect association-dead errors for per-worker backoff tracking
+            _is_assoc_dead = (sv == -1 and detail and any(p in detail.lower() for p in
+                ('association', 'connection', 'established', 'transport', 'socket', 'timed out')))
+
             file_size = f.get('file_size', 0)
             if _is_cstore_success(sv):
                 _a700_consecutive = 0  # Reset backoff on success
+                _assoc_dead_consecutive = 0
                 if circuit_breaker: circuit_breaker.record_success()
                 msg = detail if detail else ("Copied" if sv == 0 else f"Pending (0x{sv:04X})")
                 if was_decompressed and not detail: msg = "Decompressed + Copied"
@@ -2893,6 +2944,7 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 result_queue.put((f, True, msg, sop, was_conflict_retried, file_size))
             elif sv is not None and sv >= 0:
                 if circuit_breaker: circuit_breaker.record_failure()
+                _assoc_dead_consecutive = 0
                 if sv == 0xA700:
                     _a700_consecutive += 1
                 else:
@@ -2903,10 +2955,15 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
             else:
                 if circuit_breaker: circuit_breaker.record_failure()
                 _a700_consecutive = 0
+                if _is_assoc_dead:
+                    _assoc_dead_consecutive += 1
+                else:
+                    _assoc_dead_consecutive = 0
                 msg = detail or "No response"
                 result_queue.put((f, False, msg, sop, was_conflict_retried, 0))
         except Exception as e:
             _a700_consecutive = 0
+            _assoc_dead_consecutive = 0
             result_queue.put((f, False, str(e), sop, False, 0))
 
         if not _from_priority: file_queue.task_done()
