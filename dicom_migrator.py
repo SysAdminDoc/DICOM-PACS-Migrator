@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DICOM PACS Migrator v3.2.0
+DICOM PACS Migrator v3.3.0
 Production-grade DICOM C-STORE migration tool with premium sidebar navigation,
 frameless window, glassmorphic UI, parallel worker associations,
 self-healing auto-retry, bandwidth throttling, migration scheduling, DICOM tag
@@ -85,7 +85,7 @@ from pydicom.uid import (
 from pynetdicom import AE, StoragePresentationContexts, evt
 from pynetdicom.sop_class import Verification
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 MAX_TABLE_ROWS = 5000  # Cap upload results table to prevent GUI slowdown on massive migrations
 APP_NAME = "DICOM PACS Migrator"
 
@@ -565,6 +565,7 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._opened_at = 0.0
         self._total_trips = 0
+        self._probe_granted = False  # Only one worker gets the HALF_OPEN probe slot
 
     @property
     def state(self):
@@ -573,7 +574,8 @@ class CircuitBreaker:
 
     def allow_request(self):
         """Returns True if the request should proceed. Blocks during OPEN state
-        until recovery_seconds elapsed, then transitions to HALF_OPEN."""
+        until recovery_seconds elapsed, then transitions to HALF_OPEN.
+        Only ONE worker gets the probe slot; others block until probe resolves."""
         while True:
             if self._cancel_event and self._cancel_event.is_set():
                 return False
@@ -581,15 +583,20 @@ class CircuitBreaker:
                 if self._state == self.CLOSED:
                     return True
                 if self._state == self.HALF_OPEN:
-                    return True  # One probe allowed
+                    if not self._probe_granted:
+                        self._probe_granted = True
+                        return True  # This worker is the probe
+                    # Another worker already has the probe — wait for resolution
                 # OPEN — check if recovery period has elapsed
-                elapsed = time.monotonic() - self._opened_at
-                if elapsed >= self.recovery_seconds:
-                    self._state = self.HALF_OPEN
-                    if self._log_fn:
-                        self._log_fn(f"  Circuit breaker: HALF_OPEN — sending probe request after {self.recovery_seconds}s recovery")
-                    return True
-            # Still OPEN — wait
+                elif self._state == self.OPEN:
+                    elapsed = time.monotonic() - self._opened_at
+                    if elapsed >= self.recovery_seconds:
+                        self._state = self.HALF_OPEN
+                        self._probe_granted = True  # Grant probe to this worker
+                        if self._log_fn:
+                            self._log_fn(f"  Circuit breaker: HALF_OPEN — sending probe request after {self.recovery_seconds}s recovery")
+                        return True
+            # Still OPEN or HALF_OPEN waiting for probe — wait
             time.sleep(1.0)
 
     def record_success(self):
@@ -602,6 +609,7 @@ class CircuitBreaker:
                     self._log_fn(f"  Circuit breaker: probe succeeded — CLOSED (resuming normal operation)")
                 self._consecutive_failures = 0
                 self._state = self.CLOSED
+                self._probe_granted = False
             elif self._state == self.CLOSED:
                 # Decay instead of reset: prevents one healthy worker from masking
                 # failures across multiple workers sharing this breaker
@@ -619,6 +627,7 @@ class CircuitBreaker:
                 self._state = self.OPEN
                 self._opened_at = time.monotonic()
                 self._total_trips += 1
+                self._probe_granted = False  # Release probe slot for next cycle
                 if self._log_fn:
                     self._log_fn(f"  Circuit breaker: probe FAILED — re-OPEN for {self.recovery_seconds}s (trip #{self._total_trips})")
                 return
@@ -634,6 +643,7 @@ class CircuitBreaker:
         with self._lock:
             self._state = self.CLOSED
             self._consecutive_failures = 0
+            self._probe_granted = False
 
     @property
     def stats(self):
@@ -1505,6 +1515,8 @@ def try_send_c_store(assoc, ds, fpath, decompress_fallback=True,
 
     # Check for patient ID conflict (0xFFFB) and retry with corrected PatientID
     if status_val == CONFLICT_STATUS and conflict_retry:
+        import copy as _conflict_copy
+        ds = _conflict_copy.deepcopy(ds)  # Avoid mutating caller's dataset on retry failures
         original_pid = str(getattr(ds, 'PatientID', 'N/A'))
         original_name = str(getattr(ds, 'PatientName', 'Unknown'))
         study_uid = str(getattr(ds, 'StudyInstanceUID', ''))
@@ -2857,6 +2869,9 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 time.sleep(min(2 ** attempt, 8))  # Exponential backoff
 
         if not a or not a.is_established:
+            if a:
+                try: a.release()
+                except: pass
             result_queue.put((f, False, "Association failed", sop, False, 0))
             if not _from_priority: file_queue.task_done()
             continue
@@ -2917,6 +2932,8 @@ def _send_worker(worker_id, ae_builder, host, port, ae_scp, ae_scu,
                 try: assoc.release()
                 except: pass
                 assoc = None  # Force _get_assoc to create fresh broad association next iteration
+                _a700_consecutive = 0  # Fresh association — reset stale backoff state
+                _assoc_dead_consecutive = 0
 
             # Force association reset on connection-dead errors so the next file
             # gets a fresh association instead of hitting the same dead one.
