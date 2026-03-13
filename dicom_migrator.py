@@ -548,23 +548,29 @@ class BandwidthThrottle:
 # ═══════════════════════════════════════════════════════════════════════════════
 class CircuitBreaker:
     """Thread-safe circuit breaker for destination PACS protection.
-    States: CLOSED (normal), OPEN (blocking), HALF_OPEN (probing).
+    States: CLOSED (normal), OPEN (blocking), HALF_OPEN (probing), EXHAUSTED (skip).
     After `failure_threshold` consecutive failures, enters OPEN state for
     `recovery_seconds`. Then allows one probe request (HALF_OPEN). If probe
-    succeeds, resets to CLOSED. If probe fails, re-opens for another cycle."""
+    succeeds, resets to CLOSED. If probe fails, re-opens for another cycle.
+    After `max_probe_failures` consecutive probe failures, enters EXHAUSTED
+    state — allow_request() returns False immediately so callers can skip ahead."""
 
     CLOSED = 'CLOSED'
     OPEN = 'OPEN'
     HALF_OPEN = 'HALF_OPEN'
+    EXHAUSTED = 'EXHAUSTED'
 
-    def __init__(self, failure_threshold=5, recovery_seconds=60, cancel_event=None, log_fn=None):
+    def __init__(self, failure_threshold=5, recovery_seconds=60, cancel_event=None,
+                 log_fn=None, max_probe_failures=2):
         self._lock = threading.Lock()
         self.failure_threshold = failure_threshold
         self.recovery_seconds = recovery_seconds
+        self.max_probe_failures = max_probe_failures
         self._cancel_event = cancel_event
         self._log_fn = log_fn
         self._state = self.CLOSED
         self._consecutive_failures = 0
+        self._consecutive_probe_failures = 0
         self._opened_at = 0.0
         self._total_trips = 0
         self._probe_granted = False  # Only one worker gets the HALF_OPEN probe slot
@@ -577,13 +583,16 @@ class CircuitBreaker:
     def allow_request(self):
         """Returns True if the request should proceed. Blocks during OPEN state
         until recovery_seconds elapsed, then transitions to HALF_OPEN.
-        Only ONE worker gets the probe slot; others block until probe resolves."""
+        Only ONE worker gets the probe slot; others block until probe resolves.
+        Returns False immediately if EXHAUSTED (repeated probe failures)."""
         while True:
             if self._cancel_event and self._cancel_event.is_set():
                 return False
             with self._lock:
                 if self._state == self.CLOSED:
                     return True
+                if self._state == self.EXHAUSTED:
+                    return False  # Skip immediately — destination confirmed unreachable
                 if self._state == self.HALF_OPEN:
                     if not self._probe_granted:
                         self._probe_granted = True
@@ -610,6 +619,7 @@ class CircuitBreaker:
                 if self._log_fn:
                     self._log_fn(f"  Circuit breaker: probe succeeded — CLOSED (resuming normal operation)")
                 self._consecutive_failures = 0
+                self._consecutive_probe_failures = 0
                 self._state = self.CLOSED
                 self._probe_granted = False
             elif self._state == self.CLOSED:
@@ -621,17 +631,26 @@ class CircuitBreaker:
             # and HALF_OPEN probe must complete before resuming.
 
     def record_failure(self):
-        """Record a failed request. May trip the breaker to OPEN."""
+        """Record a failed request. May trip the breaker to OPEN or EXHAUSTED."""
         with self._lock:
             self._consecutive_failures += 1
             if self._state == self.HALF_OPEN:
-                # Probe failed — re-open
-                self._state = self.OPEN
-                self._opened_at = time.monotonic()
+                # Probe failed — track consecutive probe failures
+                self._consecutive_probe_failures += 1
                 self._total_trips += 1
                 self._probe_granted = False  # Release probe slot for next cycle
-                if self._log_fn:
-                    self._log_fn(f"  Circuit breaker: probe FAILED — re-OPEN for {self.recovery_seconds}s (trip #{self._total_trips})")
+                if self._consecutive_probe_failures >= self.max_probe_failures:
+                    # Too many probe failures — destination is unreachable, stop blocking
+                    self._state = self.EXHAUSTED
+                    if self._log_fn:
+                        self._log_fn(f"  Circuit breaker: EXHAUSTED after {self._consecutive_probe_failures} consecutive "
+                                     f"probe failures — skipping remaining files (trip #{self._total_trips})")
+                else:
+                    self._state = self.OPEN
+                    self._opened_at = time.monotonic()
+                    if self._log_fn:
+                        self._log_fn(f"  Circuit breaker: probe FAILED — re-OPEN for {self.recovery_seconds}s "
+                                     f"(trip #{self._total_trips}, probe failure {self._consecutive_probe_failures}/{self.max_probe_failures})")
                 return
             if self._consecutive_failures >= self.failure_threshold and self._state == self.CLOSED:
                 self._state = self.OPEN
@@ -645,13 +664,19 @@ class CircuitBreaker:
         with self._lock:
             self._state = self.CLOSED
             self._consecutive_failures = 0
+            self._consecutive_probe_failures = 0
             self._probe_granted = False
+
+    @property
+    def is_exhausted(self):
+        with self._lock:
+            return self._state == self.EXHAUSTED
 
     @property
     def stats(self):
         with self._lock:
             return {'state': self._state, 'consecutive_failures': self._consecutive_failures,
-                    'total_trips': self._total_trips}
+                    'total_trips': self._total_trips, 'probe_failures': self._consecutive_probe_failures}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3413,9 +3438,9 @@ class UploadThread(QThread):
                 # Group by study for atomic study-level transfers
                 study_groups = group_files_by_study(self.files)
                 for study_uid, study_files in study_groups:
-                    if self._cancel: break
+                    if self._cancel or self._circuit_breaker.is_exhausted: break
                     for f in study_files:
-                        if self._cancel: break
+                        if self._cancel or self._circuit_breaker.is_exhausted: break
                         sop = f.get('sop_instance_uid', '')
                         if self.manifest and self.manifest.should_skip_on_resume(sop):
                             result_q.put((f, True, "Already sent (resumed)", sop, False, 0))
@@ -3426,7 +3451,7 @@ class UploadThread(QThread):
                         file_q.put(f)
             else:
                 for f in self.files:
-                    if self._cancel: break
+                    if self._cancel or self._circuit_breaker.is_exhausted: break
                     sop = f.get('sop_instance_uid', '')
                     if self.manifest and self.manifest.should_skip_on_resume(sop):
                         result_q.put((f, True, "Already sent (resumed)", sop, False, 0))
@@ -4596,8 +4621,22 @@ class StreamingMigrationThread(QThread):
 
             # Send this directory's files in batches
             _batch_sz = self._live_config.get('batch_size', self.batch_size)
+            _cb_exhausted = False
             for batch_start in range(0, len(dir_files), _batch_sz):
                 if self._cancel: break
+                # Circuit breaker exhausted — skip remaining batches in this folder
+                if self._circuit_breaker and self._circuit_breaker.is_exhausted:
+                    remaining = len(dir_files) - batch_start
+                    failed += remaining
+                    self.log.emit(f"  Circuit breaker exhausted — skipping {remaining} remaining files in {rel_dir}")
+                    for rf in dir_files[batch_start:]:
+                        sop = rf.get('sop_instance_uid', '')
+                        self.file_sent.emit(rf['path'], False, "Circuit breaker exhausted — folder skipped", sop)
+                        if self.manifest:
+                            self.manifest.record_file(sop, rf['path'], 'failed', 'Circuit breaker exhausted',
+                                **{k: rf.get(k, '') for k in ('patient_name','patient_id','study_date','study_desc','series_desc','modality','study_instance_uid','series_instance_uid','sop_class_uid')})
+                    _cb_exhausted = True
+                    break
                 batch = dir_files[batch_start:batch_start + _batch_sz]
                 if self.workers > 1:
                     sent, failed, skipped, bytes_sent = self._send_batch_parallel(
@@ -4606,6 +4645,11 @@ class StreamingMigrationThread(QThread):
                 else:
                     sent, failed, skipped, bytes_sent = self._send_batch(
                         batch, sent, failed, skipped, bytes_sent, start_time)
+
+            # Reset circuit breaker after folder skip so next folder gets a fresh chance
+            if _cb_exhausted and self._circuit_breaker:
+                self._circuit_breaker.reset()
+                self.log.emit(f"  Circuit breaker reset for next folder")
 
             # Save manifest periodically
             if self.manifest and dirs_done % 10 == 0:
