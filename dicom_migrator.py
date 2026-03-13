@@ -3247,8 +3247,13 @@ class UploadThread(QThread):
     def run(self):
         total = len(self.files); sent = failed = skipped = 0
         start_time = time.time(); bytes_sent = 0
+        # STOW-RS requires parallel mode (serial path only supports C-STORE)
+        if self.transport == "DICOMweb STOW-RS" and self.workers < 2:
+            self.workers = 2
         self.log.emit(f"{'='*60}")
         self.log.emit(f"COPY-ONLY: {DATA_SAFETY_NOTICE}")
+        if self.transport == "DICOMweb STOW-RS":
+            self.log.emit(f"Transport: DICOMweb STOW-RS — {self.stowrs_url}")
         if self.conflict_retry:
             self.log.emit(f"Patient ID conflict resolution ENABLED (C-FIND remap, suffix fallback: '{self.conflict_suffix}')")
         if self.workers > 1:
@@ -3268,9 +3273,11 @@ class UploadThread(QThread):
                           f"{tod.peak_end.strftime('%H:%M')} ({tod.peak_workers} worker(s), {tod.peak_delay}s delay)")
         self.log.emit(f"{'='*60}")
 
-        # Pre-flight: query destination to skip studies that already exist
+        # Pre-flight: query destination to skip studies that already exist (C-STORE only)
         existing_studies = set()
-        if self.skip_existing:
+        if self.skip_existing and self.transport == "DICOMweb STOW-RS":
+            self.log.emit("Skip existing: not available with STOW-RS (C-FIND requires DICOM association)")
+        elif self.skip_existing:
             study_uids = list(set(f.get('study_instance_uid', '') for f in self.files if f.get('study_instance_uid')))
             if study_uids:
                 self.log.emit(f"Pre-flight: checking {len(study_uids)} studies on destination...")
@@ -3366,7 +3373,7 @@ class UploadThread(QThread):
         """Send files using multiple worker threads with persistent associations.
         After the primary pass, automatically retries transient failures in waves."""
         sent = failed = skipped = 0; bytes_sent = 0
-        all_sop_classes = list(set(f['sop_class_uid'] for f in self.files))
+        all_sop_classes = [f['sop_class_uid'] for f in self.files]  # Keep duplicates for frequency counting
         ae_builder = lambda: self._build_ae(all_sop_classes)
 
         file_q = queue.Queue(maxsize=self.workers * 4)
@@ -3995,7 +4002,7 @@ class StreamingMigrationThread(QThread):
 
     def _send_batch(self, batch, sent, failed, skipped, bytes_sent, start_time):
         """Send a batch of parsed DICOM file dicts. Returns updated counters."""
-        sop_classes = list(set(f['sop_class_uid'] for f in batch))
+        sop_classes = [f['sop_class_uid'] for f in batch]  # Keep duplicates for frequency counting
         ae = self._build_ae(sop_classes)
         _a700_consecutive = 0  # Adaptive backoff for PACS backpressure
 
@@ -4300,7 +4307,7 @@ class StreamingMigrationThread(QThread):
             else:
                 # Serial path
                 wave_sent = 0
-                all_sops = list(set(f['sop_class_uid'] for f in retry_files))
+                all_sops = [f['sop_class_uid'] for f in retry_files]  # Keep duplicates for frequency counting
                 ae = self._build_ae(all_sops)
                 try:
                     assoc = self._associate(ae)
@@ -4363,10 +4370,15 @@ class StreamingMigrationThread(QThread):
         sent = failed = skipped = 0; bytes_sent = 0
         start_time = time.time(); dirs_done = 0
         root = self.root_folder
+        # STOW-RS requires parallel mode (serial path only supports C-STORE)
+        if self.transport == "DICOMweb STOW-RS" and self.workers < 2:
+            self.workers = 2
 
         self.log.emit(f"{'='*60}")
         self.log.emit(f"STREAMING MIGRATION (COPY-ONLY)")
         self.log.emit(f"{DATA_SAFETY_NOTICE}")
+        if self.transport == "DICOMweb STOW-RS":
+            self.log.emit(f"Transport: DICOMweb STOW-RS — {self.stowrs_url}")
         if self.conflict_retry:
             self.log.emit(f"Patient ID conflict resolution ENABLED (C-FIND remap, suffix fallback: '{self.conflict_suffix}')")
         if self.workers > 1:
@@ -4552,8 +4564,8 @@ class StreamingMigrationThread(QThread):
                                          self._cancel_event, log_fn=lambda m: self.log.emit(m)):
                     break  # Cancelled while waiting
 
-            # Skip files from studies already on destination
-            if self.skip_existing:
+            # Skip files from studies already on destination (C-STORE only, requires C-FIND)
+            if self.skip_existing and self.transport != "DICOMweb STOW-RS":
                 new_study_uids = set(f['study_instance_uid'] for f in dir_files if f['study_instance_uid']) - self._checked_studies
                 if new_study_uids:
                     newly_existing = preflight_check_destination(
@@ -6311,19 +6323,23 @@ class MainWindow(QMainWindow):
         assist = QPushButton("Connection Assistant - Auto-Discover DICOM Nodes")
         assist.setStyleSheet("background-color: #cba6f7; color: #1e1e2e; font-size: 13px; padding: 8px 16px; font-weight: bold;")
         assist.clicked.connect(self._open_assistant); dl.addWidget(assist)
+        # C-STORE connection fields (hidden when STOW-RS selected)
+        self._cstore_fields_widget = QWidget()
+        _cfl = QVBoxLayout(self._cstore_fields_widget); _cfl.setContentsMargins(0, 0, 0, 0); _cfl.setSpacing(6)
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Host/IP:")); self.host_input = QLineEdit(); self.host_input.setPlaceholderText("192.168.1.100"); r1.addWidget(self.host_input, 1)
         r1.addWidget(QLabel("Port:"))
         self.port_input = QSpinBox(); self.port_input.setRange(1, 65535); self.port_input.setValue(104); r1.addWidget(self.port_input)
-        dl.addLayout(r1)
+        _cfl.addLayout(r1)
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("SCU AE:")); self.ae_scu = QLineEdit("DICOM_MIGRATOR"); self.ae_scu.setMaxLength(16); r2.addWidget(self.ae_scu, 1)
         r2.addWidget(QLabel("SCP AE:")); self.ae_scp = QLineEdit("ANY-SCP"); self.ae_scp.setMaxLength(16); r2.addWidget(self.ae_scp, 1)
-        dl.addLayout(r2)
+        _cfl.addLayout(r2)
         r3 = QHBoxLayout()
         r3.addWidget(QLabel("Hostname:")); self.hostname_lbl = QLabel("-"); self.hostname_lbl.setStyleSheet("color: #6c7086;"); r3.addWidget(self.hostname_lbl, 1)
         r3.addWidget(QLabel("Impl:")); self.impl_lbl = QLabel("-"); self.impl_lbl.setStyleSheet("color: #6c7086;"); r3.addWidget(self.impl_lbl, 1)
-        dl.addLayout(r3)
+        _cfl.addLayout(r3)
+        dl.addWidget(self._cstore_fields_widget)
         tr = QHBoxLayout()
         tr.addWidget(QLabel("Transport:"))
         self.transport_combo = QComboBox()
@@ -6332,7 +6348,9 @@ class MainWindow(QMainWindow):
             "STOW-RS: HTTP-based DICOMweb upload for cloud PACS")
         self.transport_combo.currentTextChanged.connect(self._on_transport_changed)
         tr.addWidget(self.transport_combo)
-        tr.addWidget(QLabel("URL:"))
+        self._stowrs_url_label = QLabel("URL:")
+        self._stowrs_url_label.setVisible(False)
+        tr.addWidget(self._stowrs_url_label)
         self.stowrs_url = QLineEdit()
         self.stowrs_url.setPlaceholderText("https://pacs.example.com/dicom-web/studies")
         self.stowrs_url.setToolTip("DICOMweb STOW-RS endpoint URL")
@@ -7088,13 +7106,11 @@ class MainWindow(QMainWindow):
     def _on_transport_changed(self, text):
         """Toggle UI elements based on transport mode."""
         is_stowrs = text == "DICOMweb STOW-RS"
+        self._stowrs_url_label.setVisible(is_stowrs)
         self.stowrs_url.setVisible(is_stowrs)
         self.stowrs_auth.setVisible(is_stowrs)
-        # C-STORE fields
-        self.host_input.setVisible(not is_stowrs)
-        self.port_input.setVisible(not is_stowrs)
-        self.ae_scu.setVisible(not is_stowrs)
-        self.ae_scp.setVisible(not is_stowrs)
+        # C-STORE fields container (host, port, AE titles, hostname, impl)
+        self._cstore_fields_widget.setVisible(not is_stowrs)
         self.echo_btn.setVisible(not is_stowrs)
         self.echo_status.setVisible(not is_stowrs)
 
@@ -7475,7 +7491,10 @@ class MainWindow(QMainWindow):
             self._log("Enter host"); self._set_page(0); return
         self._save_settings()
 
-        self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
+        if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+            self.manifest.meta['destination'] = f"STOW-RS: {self.stowrs_url.text().strip()}"
+        else:
+            self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
         self.upload_table.setRowCount(0); self.upload_progress.setValue(0)
         self.upload_progress.setMaximum(len(files_to_send))
         self._sent = self._failed = self._skipped = self._conflict_retries = 0; self._upload_results = []
@@ -7515,8 +7534,11 @@ class MainWindow(QMainWindow):
             audit_path = os.path.join(os.path.dirname(self.manifest.path) if self.manifest.path
                          else os.path.expanduser('~'), f"migration_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
             self._audit_logger = AuditLogger(audit_path)
+            _audit_dest = (f"STOW-RS: {self.stowrs_url.text().strip()}"
+                           if self.transport_combo.currentText() == "DICOMweb STOW-RS"
+                           else f"{host}:{self.port_input.value()}")
             self._audit_logger.log_event('migration_start',
-                source=self.folder_input.text(), destination=f"{host}:{self.port_input.value()}",
+                source=self.folder_input.text(), destination=_audit_dest,
                 file_count=len(files_to_send), ae_scu=self.ae_scu.text().strip(),
                 ae_scp=self.ae_scp.text().strip())
             self._log(f"Audit log: {audit_path}")
@@ -7581,7 +7603,10 @@ class MainWindow(QMainWindow):
             if self.manifest.load():
                 sc = self.manifest.get_sent_count()
                 self._log(f"Loaded manifest: {sc:,} previously sent files will be skipped")
-        self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
+        if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+            self.manifest.meta['destination'] = f"STOW-RS: {self.stowrs_url.text().strip()}"
+        else:
+            self.manifest.meta['destination'] = f"{host}:{self.port_input.value()}"
 
         # Reset upload UI
         self.upload_table.setRowCount(0)
@@ -7694,10 +7719,13 @@ class MainWindow(QMainWindow):
             if at.enabled and at._sample_count > 0:
                 self._log(f"Adaptive throttle: avg response latency {at._avg_latency:.3f}s ({at._sample_count:,} samples)")
 
-        # Auto-verify after streaming
+        # Auto-verify after streaming (C-FIND requires DICOM association, not available with STOW-RS)
         if sent > 0 and self.auto_verify_check.isChecked():
-            self._log("Auto-verify: running two-point C-FIND confirmation...")
-            QTimer.singleShot(500, self._start_verify)
+            if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+                self._log("Auto-verify: skipped (C-FIND not available with STOW-RS transport)")
+            else:
+                self._log("Auto-verify: running two-point C-FIND confirmation...")
+                QTimer.singleShot(500, self._start_verify)
 
         # Finalize HIPAA audit log
         if hasattr(self, '_audit_logger') and self._audit_logger.enabled:
@@ -7883,10 +7911,13 @@ class MainWindow(QMainWindow):
             if at['sample_count'] > 0:
                 self._log(f"Adaptive throttle: avg response latency {at['avg_latency']:.3f}s ({at['sample_count']:,} samples)")
 
-        # Auto-verify: run C-FIND confirmation if enabled and migration had successful sends
+        # Auto-verify: run C-FIND confirmation if enabled (not available with STOW-RS)
         if sent > 0 and self.auto_verify_check.isChecked():
-            self._log("Auto-verify: running two-point C-FIND confirmation...")
-            QTimer.singleShot(500, self._start_verify)
+            if self.transport_combo.currentText() == "DICOMweb STOW-RS":
+                self._log("Auto-verify: skipped (C-FIND not available with STOW-RS transport)")
+            else:
+                self._log("Auto-verify: running two-point C-FIND confirmation...")
+                QTimer.singleShot(500, self._start_verify)
 
         # Finalize HIPAA audit log
         if hasattr(self, '_audit_logger') and self._audit_logger.enabled:
@@ -9197,6 +9228,11 @@ tr:nth-child(even) {{ background: #181825; }}
         s.setValue("smtp_to", self.smtp_to.text())
         s.setValue("notify_webhook", self.notify_webhook_check.isChecked())
         s.setValue("webhook_url", self.webhook_url.text())
+        # v3.4.0 settings
+        s.setValue("transport", self.transport_combo.currentText())
+        s.setValue("stowrs_url", self.stowrs_url.text())
+        s.setValue("stowrs_auth", self.stowrs_auth.text())
+        s.setValue("sort_order", self.sort_order_combo.currentText())
 
     def _load_settings(self):
         s = self.settings
@@ -9257,6 +9293,17 @@ tr:nth-child(even) {{ background: #181825; }}
         st = s.value("smtp_to"); self.smtp_to.setText(st) if st else None
         _load_bool("notify_webhook", self.notify_webhook_check, False)
         wu = s.value("webhook_url"); self.webhook_url.setText(wu) if wu else None
+        # v3.4.0 settings
+        _transport = s.value("transport")
+        if _transport and _transport in ["DICOM C-STORE", "DICOMweb STOW-RS"]:
+            self.transport_combo.setCurrentText(_transport)
+        _stowrs_url = s.value("stowrs_url")
+        if _stowrs_url: self.stowrs_url.setText(_stowrs_url)
+        _stowrs_auth = s.value("stowrs_auth")
+        if _stowrs_auth: self.stowrs_auth.setText(_stowrs_auth)
+        _sort = s.value("sort_order")
+        if _sort and _sort in ["Directory Order", "Newest First", "Oldest First"]:
+            self.sort_order_combo.setCurrentText(_sort)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
